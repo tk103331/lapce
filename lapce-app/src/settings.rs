@@ -29,9 +29,9 @@ use serde_json::Value;
 use crate::{
     command::CommandExecuted,
     config::{
-        DropdownInfo, LapceConfig, color::LapceColor, core::CoreConfig,
-        editor::EditorConfig, icon::LapceIcons, terminal::TerminalConfig,
-        ui::UIConfig,
+        DropdownInfo, LapceConfig, agent::AgentConfig, color::LapceColor,
+        core::CoreConfig, editor::EditorConfig, icon::LapceIcons,
+        terminal::TerminalConfig, ui::UIConfig,
     },
     keypress::KeyPressFocus,
     main_split::Editors,
@@ -180,6 +180,12 @@ impl SettingsData {
                     &TerminalConfig::FIELDS[..],
                     &TerminalConfig::DESCS[..],
                     into_settings_map(&config.terminal),
+                ),
+                (
+                    "Agent",
+                    &AgentConfig::FIELDS[..],
+                    &AgentConfig::DESCS[..],
+                    into_settings_map(&config.agent),
                 ),
             ] {
                 let pos = cx.create_rw_signal(Point::new(0.0, item_height_accum));

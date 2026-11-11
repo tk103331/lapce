@@ -17,6 +17,7 @@ use floem::{
 };
 
 use super::{
+    agent_view::agent_panel,
     debug_view::debug_panel,
     global_search_view::global_search_panel,
     kind::PanelKind,
@@ -474,6 +475,9 @@ fn panel_view(
                 PanelKind::Terminal => {
                     terminal_panel(window_tab_data.clone()).into_any()
                 }
+                PanelKind::Agent => {
+                    agent_panel(window_tab_data.clone(), position).into_any()
+                }
                 PanelKind::FileExplorer => {
                     file_explorer_panel(window_tab_data.clone(), position).into_any()
                 }
@@ -553,6 +557,7 @@ fn panel_picker(
             let window_tab_data = window_tab_data.clone();
             let tooltip = match p {
                 PanelKind::Terminal => "Terminal",
+                PanelKind::Agent => "Agent",
                 PanelKind::FileExplorer => "File Explorer",
                 PanelKind::SourceControl => "Source Control",
                 PanelKind::Plugin => "Plugins",

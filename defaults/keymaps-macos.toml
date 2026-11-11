@@ -254,6 +254,10 @@ key = "meta+shift+e"
 command = "toggle_file_explorer_focus"
 
 [[keymaps]]
+key = "meta+shift+a"
+command = "toggle_agent_focus"
+
+[[keymaps]]
 key = "meta+shift+f"
 command = "toggle_search_focus"
 

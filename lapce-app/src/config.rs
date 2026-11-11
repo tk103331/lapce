@@ -18,6 +18,7 @@ use strum::VariantNames;
 use tracing::error;
 
 use self::{
+    agent::AgentConfig,
     color::LapceColor,
     color_theme::{ColorThemeConfig, ThemeColor, ThemeColorPreference},
     core::CoreConfig,
@@ -30,6 +31,7 @@ use self::{
 };
 use crate::workspace::{LapceWorkspace, LapceWorkspaceType};
 
+pub mod agent;
 pub mod color;
 pub mod color_theme;
 pub mod core;
@@ -100,6 +102,8 @@ pub struct LapceConfig {
     pub ui: UIConfig,
     pub editor: EditorConfig,
     pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub agent: AgentConfig,
     #[serde(default)]
     pub color_theme: ColorThemeConfig,
     #[serde(default)]

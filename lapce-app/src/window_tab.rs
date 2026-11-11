@@ -53,6 +53,7 @@ use tracing::{Level, debug, error, event};
 
 use crate::{
     about::AboutData,
+    agent::AgentData,
     alert::{AlertBoxData, AlertButton},
     code_action::{CodeActionData, CodeActionStatus},
     command::{
@@ -184,6 +185,7 @@ pub struct WindowTabData {
     pub source_control: SourceControlData,
     pub rename: RenameData,
     pub global_search: GlobalSearchData,
+    pub agent: AgentData,
     pub call_hierarchy_data: CallHierarchyData,
     pub about_data: AboutData,
     pub alert_data: AlertBoxData,
@@ -460,9 +462,10 @@ impl WindowTabData {
         let panel = workspace_info
             .as_ref()
             .map(|i| {
-                let panel_order = db
+                let mut panel_order = db
                     .get_panel_orders()
                     .unwrap_or_else(|_| default_panel_order());
+                crate::panel::data::ensure_default_panels(&mut panel_order);
                 PanelData {
                     panels: cx.create_rw_signal(panel_order),
                     styles: cx.create_rw_signal(i.panel.styles.clone()),
@@ -518,6 +521,7 @@ impl WindowTabData {
 
         let rename = RenameData::new(cx, main_split.editors, common.clone());
         let global_search = GlobalSearchData::new(cx, main_split.clone());
+        let agent = AgentData::new(cx, main_split.editors, common.clone());
 
         let plugin = PluginData::new(
             cx,
@@ -565,6 +569,7 @@ impl WindowTabData {
             plugin,
             rename,
             global_search,
+            agent,
             call_hierarchy_data: CallHierarchyData {
                 root: cx.create_rw_signal(None),
                 common: common.clone(),
@@ -1296,6 +1301,9 @@ impl WindowTabData {
             ToggleFileExplorerFocus => {
                 self.toggle_panel_focus(PanelKind::FileExplorer);
             }
+            ToggleAgentFocus => {
+                self.toggle_panel_focus(PanelKind::Agent);
+            }
             ToggleProblemFocus => {
                 self.toggle_panel_focus(PanelKind::Problem);
             }
@@ -1313,6 +1321,9 @@ impl WindowTabData {
             }
             ToggleFileExplorerVisual => {
                 self.toggle_panel_visual(PanelKind::FileExplorer);
+            }
+            ToggleAgentVisual => {
+                self.toggle_panel_visual(PanelKind::Agent);
             }
             ToggleProblemVisual => {
                 self.toggle_panel_visual(PanelKind::Problem);
@@ -2684,6 +2695,7 @@ impl WindowTabData {
                 self.panel.is_panel_visible(&kind)
             }
             PanelKind::Terminal
+            | PanelKind::Agent
             | PanelKind::SourceControl
             | PanelKind::Search
             | PanelKind::FileExplorer => self.is_panel_focused(kind),

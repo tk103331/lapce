@@ -7,6 +7,7 @@
 - (Un)confirmed state of the editor is properly (re)stored
 - Implemented Folder/File choosing in remotes
 - The file explorer can now be focused with the mouse, and has keybinds for renaming/deleting files
+- Added an Agent Chat panel that talks to ACP (Agent Client Protocol) compatible agents
 
 ### Bug Fixes
 

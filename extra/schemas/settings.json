@@ -15,6 +15,9 @@
                 "terminal": {
                     "$ref": "#/definitions/Terminal"
                 },
+                "agent": {
+                    "$ref": "#/definitions/Agent"
+                },
                 "ui": {
                     "$ref": "#/definitions/UI"
                 },
@@ -284,6 +287,20 @@
             },
             "required": [],
             "title": "Editor"
+        },
+        "Agent": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "command": {
+                    "type": "string"
+                },
+                "auto-approve": {
+                    "type": "boolean"
+                }
+            },
+            "required": [],
+            "title": "Agent"
         },
         "Terminal": {
             "type": "object",

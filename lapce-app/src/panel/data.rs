@@ -20,12 +20,26 @@ use crate::{
 
 pub type PanelOrder = im::HashMap<PanelPosition, im::Vector<PanelKind>>;
 
+/// Make sure panels introduced after a layout was saved are added back into it.
+pub fn ensure_default_panels(panels: &mut PanelOrder) {
+    if !panels
+        .values()
+        .any(|panels| panels.contains(&PanelKind::Agent))
+    {
+        panels
+            .entry(PanelPosition::LeftTop)
+            .or_default()
+            .push_back(PanelKind::Agent);
+    }
+}
+
 pub fn default_panel_order() -> PanelOrder {
     let mut order = PanelOrder::new();
     order.insert(
         PanelPosition::LeftTop,
         im::vector![
             PanelKind::FileExplorer,
+            PanelKind::Agent,
             PanelKind::Plugin,
             PanelKind::SourceControl,
             PanelKind::Debug,
@@ -96,11 +110,12 @@ pub struct PanelData {
 impl PanelData {
     pub fn new(
         cx: Scope,
-        panels: im::HashMap<PanelPosition, im::Vector<PanelKind>>,
+        mut panels: im::HashMap<PanelPosition, im::Vector<PanelKind>>,
         available_size: Memo<Size>,
         sections: im::HashMap<PanelSection, bool>,
         common: Rc<CommonData>,
     ) -> Self {
+        ensure_default_panels(&mut panels);
         let panels = cx.create_rw_signal(panels);
 
         let mut styles = im::HashMap::new();

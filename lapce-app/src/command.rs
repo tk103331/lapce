@@ -466,6 +466,10 @@ pub enum LapceWorkbenchCommand {
     #[strum(serialize = "toggle_file_explorer_focus")]
     ToggleFileExplorerFocus,
 
+    #[strum(message = "Toggle Agent Focus")]
+    #[strum(serialize = "toggle_agent_focus")]
+    ToggleAgentFocus,
+
     #[strum(message = "Toggle Problem Focus")]
     #[strum(serialize = "toggle_problem_focus")]
     ToggleProblemFocus,
@@ -486,6 +490,10 @@ pub enum LapceWorkbenchCommand {
 
     #[strum(serialize = "toggle_file_explorer_visual")]
     ToggleFileExplorerVisual,
+
+    #[strum(message = "Toggle Agent Visual")]
+    #[strum(serialize = "toggle_agent_visual")]
+    ToggleAgentVisual,
 
     #[strum(serialize = "toggle_problem_visual")]
     ToggleProblemVisual,
