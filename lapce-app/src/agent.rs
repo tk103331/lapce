@@ -28,7 +28,12 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use crate::{
-    config::agent::AgentConfig, editor::EditorData, main_split::Editors,
+    config::{
+        LapceConfig,
+        agent::{AgentConfig, AgentProfile},
+    },
+    editor::EditorData,
+    main_split::Editors,
     window_tab::CommonData,
 };
 
@@ -77,6 +82,54 @@ pub struct PendingPermission {
     pub options: Vec<PermissionOption>,
 }
 
+/// A model or session mode offered by an ACP agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentChoice {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct AgentChoiceState {
+    pub available: Vec<AgentChoice>,
+    pub current: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentConfigValueOption {
+    pub value: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentConfigOptionKind {
+    Select {
+        current: String,
+        options: Vec<AgentConfigValueOption>,
+    },
+    Boolean {
+        current: bool,
+    },
+}
+
+/// A session configuration option advertised by an ACP agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentConfigOption {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub kind: AgentConfigOptionKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentConfigValue {
+    Select(String),
+    Boolean(bool),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum AgentStatus {
     #[default]
@@ -123,6 +176,12 @@ enum AgentCommand {
     Cancel,
     NewSession,
     Shutdown,
+    SetModel(String),
+    SetMode(String),
+    SetConfigOption {
+        config_id: String,
+        value: AgentConfigValue,
+    },
 }
 
 struct Notifier {
@@ -152,6 +211,9 @@ struct Store {
     plan_message: Option<u64>,
     tool_messages: HashMap<String, u64>,
     restart_requested: bool,
+    models: Option<AgentChoiceState>,
+    modes: Option<AgentChoiceState>,
+    config_options: Vec<AgentConfigOption>,
 }
 
 impl Store {
@@ -217,6 +279,9 @@ impl Store {
         self.permission = None;
         self.permission_tx = None;
         self.status = AgentStatus::Idle;
+        self.models = None;
+        self.modes = None;
+        self.config_options.clear();
     }
 
     fn tool_call(
@@ -342,16 +407,27 @@ pub struct AgentData {
     pub permission: RwSignal<Option<PendingPermission>>,
     pub revision: ReadSignal<Option<u64>>,
     pub auto_scroll: RwSignal<bool>,
+    pub models: RwSignal<Option<AgentChoiceState>>,
+    pub modes: RwSignal<Option<AgentChoiceState>>,
+    pub config_options: RwSignal<im::Vector<AgentConfigOption>>,
+    pub profiles: RwSignal<im::Vector<AgentProfile>>,
+    pub active_profile: RwSignal<String>,
+    pub show_add_agent: RwSignal<bool>,
+    pub new_agent_name_input: EditorData,
+    pub new_agent_command_input: EditorData,
     store: Arc<Mutex<Store>>,
     notifier: Arc<Notifier>,
     sender: Arc<Mutex<Option<Sender<AgentCommand>>>>,
     running: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
+    profile: Arc<Mutex<Option<AgentProfile>>>,
 }
 
 impl AgentData {
     pub fn new(cx: Scope, editors: Editors, common: Rc<CommonData>) -> Self {
         let input = editors.make_local(cx, common.clone());
+        let new_agent_name_input = editors.make_local(cx, common.clone());
+        let new_agent_command_input = editors.make_local(cx, common.clone());
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let revision = create_signal_from_channel(receiver);
         let notifier = Arc::new(Notifier {
@@ -359,6 +435,11 @@ impl AgentData {
             sender,
         });
         let store = Arc::new(Mutex::new(Store::default()));
+
+        let agent_config = common.config.get_untracked().agent.clone();
+        let profiles: im::Vector<AgentProfile> =
+            agent_config.profiles().into_iter().collect();
+        let active_profile = agent_config.active_profile();
 
         let data = Self {
             common,
@@ -369,11 +450,20 @@ impl AgentData {
             permission: cx.create_rw_signal(None),
             revision,
             auto_scroll: cx.create_rw_signal(true),
+            models: cx.create_rw_signal(None),
+            modes: cx.create_rw_signal(None),
+            config_options: cx.create_rw_signal(im::Vector::new()),
+            profiles: cx.create_rw_signal(profiles),
+            active_profile: cx.create_rw_signal(active_profile.name.clone()),
+            show_add_agent: cx.create_rw_signal(false),
+            new_agent_name_input,
+            new_agent_command_input,
             store,
             notifier,
             sender: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             epoch: Arc::new(AtomicU64::new(0)),
+            profile: Arc::new(Mutex::new(Some(active_profile))),
         };
 
         let data_for_effect = data.clone();
@@ -387,7 +477,16 @@ impl AgentData {
     }
 
     fn sync(&self) {
-        let (messages, status, agent_name, permission, restart) = {
+        let (
+            messages,
+            status,
+            agent_name,
+            permission,
+            models,
+            modes,
+            config_options,
+            restart,
+        ) = {
             let mut store = self.store.lock();
             let restart =
                 store.restart_requested && !self.running.load(Ordering::SeqCst);
@@ -399,6 +498,13 @@ impl AgentData {
                 store.status.clone(),
                 store.agent_name.clone(),
                 store.permission.clone(),
+                store.models.clone(),
+                store.modes.clone(),
+                store
+                    .config_options
+                    .iter()
+                    .cloned()
+                    .collect::<im::Vector<_>>(),
                 restart,
             )
         };
@@ -411,6 +517,15 @@ impl AgentData {
         }
         if self.permission.get_untracked() != permission {
             self.permission.set(permission);
+        }
+        if self.models.get_untracked() != models {
+            self.models.set(models);
+        }
+        if self.modes.get_untracked() != modes {
+            self.modes.set(modes);
+        }
+        if self.config_options.get_untracked() != config_options {
+            self.config_options.set(config_options);
         }
 
         self.messages.update(|existing| {
@@ -562,6 +677,137 @@ impl AgentData {
         self.notifier.notify();
     }
 
+    pub fn toggle_add_agent(&self) {
+        self.show_add_agent.update(|show| *show = !*show);
+    }
+
+    /// Add the agent described by the inline form and start using it.
+    pub fn submit_new_agent(&self) {
+        let command = self
+            .new_agent_command_input
+            .doc()
+            .buffer
+            .with(|buffer| buffer.to_string());
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return;
+        }
+
+        let name = self
+            .new_agent_name_input
+            .doc()
+            .buffer
+            .with(|buffer| buffer.to_string());
+        let name = name.trim().to_string();
+        let name = if name.is_empty() {
+            command
+                .split_whitespace()
+                .next()
+                .unwrap_or("Agent")
+                .to_string()
+        } else {
+            name
+        };
+
+        let profile = AgentProfile { name, command };
+        self.profiles
+            .update(|profiles| profiles.push_back(profile.clone()));
+        *self.profile.lock() = Some(profile.clone());
+        self.active_profile.set(profile.name.clone());
+        self.persist_agent_profiles();
+
+        self.new_agent_name_input.reset();
+        self.new_agent_command_input.reset();
+        self.show_add_agent.set(false);
+        self.restart();
+    }
+
+    /// Switch to a configured agent profile and restart the agent process.
+    pub fn select_profile(&self, name: String) {
+        if self.active_profile.get_untracked() == name
+            && self.running.load(Ordering::SeqCst)
+        {
+            return;
+        }
+
+        let profiles = self.profiles.get_untracked();
+        let Some(profile) = profiles
+            .iter()
+            .find(|profile| profile.name == name)
+            .cloned()
+        else {
+            return;
+        };
+
+        *self.profile.lock() = Some(profile.clone());
+        self.active_profile.set(profile.name);
+        self.persist_agent_profiles();
+        self.restart();
+    }
+
+    fn persist_agent_profiles(&self) {
+        let profiles: Vec<AgentProfile> =
+            self.profiles.get_untracked().iter().cloned().collect();
+        let active = self.active_profile.get_untracked();
+        LapceConfig::update_agent_profiles(&profiles, &active);
+    }
+
+    pub fn select_model(&self, model_id: String) {
+        {
+            let mut store = self.store.lock();
+            if let Some(models) = store.models.as_mut() {
+                models.current = model_id.clone();
+            }
+        }
+        self.notifier.notify();
+        self.send_command(AgentCommand::SetModel(model_id));
+    }
+
+    pub fn select_mode(&self, mode_id: String) {
+        {
+            let mut store = self.store.lock();
+            if let Some(modes) = store.modes.as_mut() {
+                modes.current = mode_id.clone();
+            }
+        }
+        self.notifier.notify();
+        self.send_command(AgentCommand::SetMode(mode_id));
+    }
+
+    pub fn set_config_option(&self, config_id: &str, value: AgentConfigValue) {
+        {
+            let mut store = self.store.lock();
+            if let Some(option) = store
+                .config_options
+                .iter_mut()
+                .find(|option| option.id == config_id)
+            {
+                match (&mut option.kind, &value) {
+                    (
+                        AgentConfigOptionKind::Select { current, .. },
+                        AgentConfigValue::Select(value),
+                    ) => *current = value.clone(),
+                    (
+                        AgentConfigOptionKind::Boolean { current },
+                        AgentConfigValue::Boolean(value),
+                    ) => *current = *value,
+                    _ => {}
+                }
+            }
+        }
+        self.notifier.notify();
+        self.send_command(AgentCommand::SetConfigOption {
+            config_id: config_id.to_string(),
+            value,
+        });
+    }
+
+    fn send_command(&self, command: AgentCommand) {
+        if let Some(sender) = self.sender.lock().as_ref() {
+            let _ = sender.send(command);
+        }
+    }
+
     fn ensure_started(&self) {
         if self.running.load(Ordering::SeqCst) {
             return;
@@ -575,7 +821,12 @@ impl AgentData {
             return;
         }
 
-        let config = self.common.config.get_untracked().agent.clone();
+        let mut config = self.common.config.get_untracked().agent.clone();
+        if let Some(profile) = self.profile.lock().clone() {
+            if !profile.command.trim().is_empty() {
+                config.command = profile.command;
+            }
+        }
         let cwd = self
             .common
             .workspace
@@ -593,6 +844,9 @@ impl AgentData {
             let mut store = self.store.lock();
             store.status = AgentStatus::Starting;
             store.agent_name = None;
+            store.models = None;
+            store.modes = None;
+            store.config_options.clear();
         }
         self.notifier.notify();
 
@@ -832,6 +1086,12 @@ impl ProtocolConnection {
             .to_string();
 
         self.session_id = Some(session_id);
+        {
+            let mut store = self.store.lock();
+            store.models = parse_models(&result["models"]);
+            store.modes = parse_modes(&result["modes"]);
+            store.config_options = parse_config_options(&result["configOptions"]);
+        }
         self.set_status(AgentStatus::Ready);
         Ok(true)
     }
@@ -853,6 +1113,15 @@ impl ProtocolConnection {
                     if !self.new_session(commands)? {
                         return Ok(());
                     }
+                }
+                Some(AgentCommand::SetModel(model_id)) => {
+                    self.send_set_model(&model_id)?;
+                }
+                Some(AgentCommand::SetMode(mode_id)) => {
+                    self.send_set_mode(&mode_id)?;
+                }
+                Some(AgentCommand::SetConfigOption { config_id, value }) => {
+                    self.send_set_config_option(&config_id, value)?;
                 }
                 Some(AgentCommand::Shutdown) | None => return Ok(()),
             }
@@ -912,6 +1181,15 @@ impl ProtocolConnection {
                     match command {
                         Ok(AgentCommand::Cancel) => {
                             self.cancel_turn()?;
+                        }
+                        Ok(AgentCommand::SetModel(model_id)) => {
+                            self.send_set_model(&model_id)?;
+                        }
+                        Ok(AgentCommand::SetMode(mode_id)) => {
+                            self.send_set_mode(&mode_id)?;
+                        }
+                        Ok(AgentCommand::SetConfigOption { config_id, value }) => {
+                            self.send_set_config_option(&config_id, value)?;
                         }
                         Ok(AgentCommand::Shutdown) | Err(_) => return Ok(()),
                         Ok(command) => {
@@ -978,6 +1256,71 @@ impl ProtocolConnection {
             "params": params,
         }))?;
         Ok(id)
+    }
+
+    fn send_set_model(&mut self, model_id: &str) -> Result<()> {
+        let Some(session_id) = self.session_id.clone() else {
+            return Ok(());
+        };
+        self.send_request_without_response(
+            "session/set_model",
+            json!({
+                "sessionId": session_id,
+                "modelId": model_id,
+            }),
+        )
+    }
+
+    fn send_set_mode(&mut self, mode_id: &str) -> Result<()> {
+        let Some(session_id) = self.session_id.clone() else {
+            return Ok(());
+        };
+        self.send_request_without_response(
+            "session/set_mode",
+            json!({
+                "sessionId": session_id,
+                "modeId": mode_id,
+            }),
+        )
+    }
+
+    fn send_set_config_option(
+        &mut self,
+        config_id: &str,
+        value: AgentConfigValue,
+    ) -> Result<()> {
+        let Some(session_id) = self.session_id.clone() else {
+            return Ok(());
+        };
+
+        let mut params = json!({
+            "sessionId": session_id,
+            "configId": config_id,
+        });
+        match value {
+            AgentConfigValue::Select(value) => {
+                params["value"] = Value::String(value);
+            }
+            AgentConfigValue::Boolean(value) => {
+                params["type"] = Value::String("boolean".to_string());
+                params["value"] = Value::Bool(value);
+            }
+        }
+        self.send_request_without_response("session/set_config_option", params)
+    }
+
+    fn send_request_without_response(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<()> {
+        self.next_id += 1;
+        self.write(json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id,
+            "method": method,
+            "params": params,
+        }))
     }
 
     fn wait_for_response(
@@ -1177,7 +1520,10 @@ impl ProtocolConnection {
                             }
                             Ok(AgentCommand::Cancel) => Some(Ok(None)),
                             Ok(AgentCommand::NewSession)
-                            | Ok(AgentCommand::Prompt(_)) => None,
+                            | Ok(AgentCommand::Prompt(_))
+                            | Ok(AgentCommand::SetModel(_))
+                            | Ok(AgentCommand::SetMode(_))
+                            | Ok(AgentCommand::SetConfigOption { .. }) => None,
                         }
                     }
                 },
@@ -1285,6 +1631,17 @@ impl ProtocolConnection {
                 "plan" => {
                     if let Some(entries) = update["entries"].as_array() {
                         store.set_plan(entries);
+                    }
+                }
+                "config_option_update" => {
+                    store.config_options =
+                        parse_config_options(&update["configOptions"]);
+                }
+                "current_mode_update" => {
+                    if let Some(mode_id) = update["currentModeId"].as_str() {
+                        if let Some(modes) = store.modes.as_mut() {
+                            modes.current = mode_id.to_string();
+                        }
                     }
                 }
                 _ => {}
@@ -1440,6 +1797,134 @@ fn response_result(response: Value) -> Result<Value> {
         bail!("{message}{details}");
     }
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn parse_choice_state(
+    value: &Value,
+    available_key: &str,
+    current_key: &str,
+    id_key: &str,
+) -> Option<AgentChoiceState> {
+    let object = value.as_object()?;
+    let current = object.get(current_key)?.as_str()?.to_string();
+    let available = object
+        .get(available_key)?
+        .as_array()?
+        .iter()
+        .filter_map(|item| {
+            let id = item.get(id_key)?.as_str()?.to_string();
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_string();
+            let description = item
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(AgentChoice {
+                id,
+                name,
+                description,
+            })
+        })
+        .collect();
+
+    Some(AgentChoiceState { available, current })
+}
+
+fn parse_models(value: &Value) -> Option<AgentChoiceState> {
+    parse_choice_state(value, "availableModels", "currentModelId", "modelId")
+}
+
+fn parse_modes(value: &Value) -> Option<AgentChoiceState> {
+    parse_choice_state(value, "availableModes", "currentModeId", "id")
+}
+
+fn parse_config_options(value: &Value) -> Vec<AgentConfigOption> {
+    value
+        .as_array()
+        .map(|options| options.iter().filter_map(parse_config_option).collect())
+        .unwrap_or_default()
+}
+
+fn parse_config_option(value: &Value) -> Option<AgentConfigOption> {
+    let id = value.get("id")?.as_str()?.to_string();
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(&id)
+        .to_string();
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let category = value
+        .get("category")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let kind = match value.get("type").and_then(Value::as_str)? {
+        "select" => AgentConfigOptionKind::Select {
+            current: value
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            options: parse_config_value_options(&value["options"]),
+        },
+        "boolean" => AgentConfigOptionKind::Boolean {
+            current: value
+                .get("currentValue")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+        _ => return None,
+    };
+
+    Some(AgentConfigOption {
+        id,
+        name,
+        description,
+        category,
+        kind,
+    })
+}
+
+fn parse_config_value_options(value: &Value) -> Vec<AgentConfigValueOption> {
+    let mut options = Vec::new();
+    if let Some(items) = value.as_array() {
+        for item in items {
+            if let Some(group) = item.get("options").and_then(Value::as_array) {
+                for option in group {
+                    if let Some(option) = parse_config_value_option(option) {
+                        options.push(option);
+                    }
+                }
+            } else if let Some(option) = parse_config_value_option(item) {
+                options.push(option);
+            }
+        }
+    }
+    options
+}
+
+fn parse_config_value_option(value: &Value) -> Option<AgentConfigValueOption> {
+    let value_id = value.get("value")?.as_str()?.to_string();
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(&value_id)
+        .to_string();
+    let description = value
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(AgentConfigValueOption {
+        value: value_id,
+        name,
+        description,
+    })
 }
 
 fn truncate_tool_output(mut content: String) -> String {

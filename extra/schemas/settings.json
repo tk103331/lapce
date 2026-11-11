@@ -297,10 +297,36 @@
                 },
                 "auto-approve": {
                     "type": "boolean"
+                },
+                "active": {
+                    "type": "string"
+                },
+                "agents": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/AgentProfile"
+                    }
                 }
             },
             "required": [],
             "title": "Agent"
+        },
+        "AgentProfile": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "name": {
+                    "type": "string"
+                },
+                "command": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "name",
+                "command"
+            ],
+            "title": "AgentProfile"
         },
         "Terminal": {
             "type": "object",

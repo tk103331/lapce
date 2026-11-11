@@ -18,7 +18,7 @@ use strum::VariantNames;
 use tracing::error;
 
 use self::{
-    agent::AgentConfig,
+    agent::{AgentConfig, AgentProfile},
     color::LapceColor,
     color_theme::{ColorThemeConfig, ThemeColor, ThemeColorPreference},
     core::CoreConfig,
@@ -983,6 +983,39 @@ impl LapceConfig {
 
     /// Update the config file with the given edit.  
     /// This should be called whenever the configuration is changed, so that it is persisted.
+    /// Persist the configured ACP agent profiles and the active profile.
+    pub fn update_agent_profiles(
+        profiles: &[AgentProfile],
+        active: &str,
+    ) -> Option<()> {
+        let mut document = Self::get_file_table().unwrap_or_default();
+        let root = document.as_table_mut();
+
+        if !root.contains_key("agent") {
+            root.insert("agent", toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let agent = root.get_mut("agent")?.as_table_mut()?;
+
+        agent.insert("active", toml_edit::value(active.to_string()));
+
+        if let Some(first) = profiles.first() {
+            agent.insert("command", toml_edit::value(first.command.clone()));
+        }
+
+        let mut agents = toml_edit::ArrayOfTables::new();
+        for profile in profiles {
+            let mut table = toml_edit::Table::new();
+            table.insert("name", toml_edit::value(profile.name.clone()));
+            table.insert("command", toml_edit::value(profile.command.clone()));
+            agents.push(table);
+        }
+        agent.insert("agents", toml_edit::Item::ArrayOfTables(agents));
+
+        let path = Self::settings_file()?;
+        std::fs::write(path, document.to_string().as_bytes()).ok()?;
+        Some(())
+    }
+
     pub fn update_file(
         parent: &str,
         key: &str,

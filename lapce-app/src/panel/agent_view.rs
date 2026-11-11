@@ -1,5 +1,6 @@
 use std::{rc::Rc, sync::Arc};
 
+use floem::views::dropdown::Dropdown;
 use floem::{
     AnyView, IntoView, View,
     event::EventListener,
@@ -18,15 +19,147 @@ use lapce_core::{command::EditCommand, mode::Mode};
 
 use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
-    agent::{AgentData, AgentMessage, AgentRole, AgentStatus, PendingPermission},
+    agent::{
+        AgentChoiceState, AgentConfigOption, AgentConfigOptionKind,
+        AgentConfigValue, AgentData, AgentMessage, AgentRole, AgentStatus,
+        PendingPermission,
+    },
     app::clickable_icon,
     command::{CommandExecuted, CommandKind},
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
+    editor::EditorData,
     keypress::{KeyPressFocus, condition::Condition},
     markdown::{MarkdownContent, parse_markdown},
     text_input::TextInputBuilder,
     window_tab::{Focus, WindowTabData},
 };
+
+trait SelectorItem: Clone + std::fmt::Display + 'static {
+    fn selector_label(&self) -> String;
+}
+
+#[derive(Clone)]
+struct ProfileChoice {
+    name: String,
+}
+
+impl std::fmt::Display for ProfileChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} ▾", self.name)
+    }
+}
+
+impl SelectorItem for ProfileChoice {
+    fn selector_label(&self) -> String {
+        self.name.clone()
+    }
+}
+
+#[derive(Clone)]
+struct ModelChoice {
+    id: String,
+    name: String,
+}
+
+impl std::fmt::Display for ModelChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} ▾", self.name)
+    }
+}
+
+impl SelectorItem for ModelChoice {
+    fn selector_label(&self) -> String {
+        self.name.clone()
+    }
+}
+
+#[derive(Clone)]
+struct ConfigValueChoice {
+    value: String,
+    name: String,
+}
+
+impl std::fmt::Display for ConfigValueChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} ▾", self.name)
+    }
+}
+
+impl SelectorItem for ConfigValueChoice {
+    fn selector_label(&self) -> String {
+        self.name.clone()
+    }
+}
+
+fn selector<T: SelectorItem>(
+    current: T,
+    items: im::Vector<T>,
+    on_accept: impl Fn(T) + 'static,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> Dropdown<T> {
+    let current = current.clone();
+    Dropdown::new(move || current.clone(), items)
+        .on_accept(on_accept)
+        .main_view(move |item| {
+            let text = item.to_string();
+            label(move || text.clone())
+                .style(move |s| {
+                    let config = config.get();
+                    s.max_width(160.0)
+                        .min_width(0.0)
+                        .text_ellipsis()
+                        .font_size(config.ui.font_size() as f32 - 1.0)
+                        .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                })
+                .into_any()
+        })
+        .list_item_view(move |item| {
+            let text = item.selector_label();
+            label(move || text.clone())
+                .style(move |s| {
+                    let config = config.get();
+                    s.width_full()
+                        .padding_horiz(8.0)
+                        .padding_vert(4.0)
+                        .font_size(config.ui.font_size() as f32 - 1.0)
+                        .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                        .hover(|s| {
+                            s.background(
+                                config.color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                            )
+                        })
+                })
+                .into_any()
+        })
+        .style(move |s| {
+            let config = config.get();
+            s.padding_horiz(6.0)
+                .padding_vert(2.0)
+                .min_width(0.0)
+                .max_width_pct(100.0)
+                .border(1.0)
+                .border_radius(4.0)
+                .border_color(config.color(LapceColor::LAPCE_BORDER))
+                .font_size(config.ui.font_size() as f32 - 1.0)
+                .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                .cursor(CursorStyle::Pointer)
+                .hover(|s| {
+                    s.background(config.color(LapceColor::PANEL_HOVERED_BACKGROUND))
+                })
+        })
+}
+
+fn option_label(text: String, config: ReadSignal<Arc<LapceConfig>>) -> impl View {
+    label(move || text.clone()).style(move |s| {
+        let config = config.get();
+        s.width(64.0)
+            .min_width(0.0)
+            .text_ellipsis()
+            .font_size(config.ui.font_size() as f32 - 1.0)
+            .color(config.color(LapceColor::EDITOR_DIM))
+            .selectable(false)
+    })
+}
 
 pub fn agent_panel(
     window_tab_data: Rc<WindowTabData>,
@@ -222,6 +355,341 @@ fn conversation(
             .width_full()
     })
     .debug_name("Agent Conversation")
+}
+
+fn config_bar(
+    agent: AgentData,
+    config: ReadSignal<Arc<LapceConfig>>,
+    focus: RwSignal<Focus>,
+) -> impl View {
+    stack((
+        profile_selector(agent.clone(), config),
+        add_agent_form(agent.clone(), config, focus),
+        options_panel(agent, config),
+    ))
+    .style(|s| s.flex_col().width_full().gap(4.0))
+}
+
+fn profile_selector(
+    agent: AgentData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    dyn_container(
+        move || (agent.profiles.get(), agent.active_profile.get()),
+        move |(profiles, active)| {
+            let items: im::Vector<ProfileChoice> = profiles
+                .iter()
+                .map(|profile| ProfileChoice {
+                    name: profile.name.clone(),
+                })
+                .collect();
+            let Some(current) = items
+                .iter()
+                .find(|choice| choice.name == active)
+                .cloned()
+                .or_else(|| items.get(0).cloned())
+            else {
+                return empty().into_any();
+            };
+
+            let select_agent = agent.clone();
+            let add_agent = agent.clone();
+            let dropdown = selector(
+                current,
+                items,
+                move |choice| select_agent.select_profile(choice.name),
+                config,
+            );
+
+            h_stack((
+                option_label("Agent".to_string(), config),
+                dropdown,
+                action_button(
+                    "+".to_string(),
+                    move || add_agent.toggle_add_agent(),
+                    config,
+                    false,
+                ),
+            ))
+            .style(|s| s.width_full().items_center().gap(6.0))
+            .into_any()
+        },
+    )
+}
+
+fn add_agent_form(
+    agent: AgentData,
+    config: ReadSignal<Arc<LapceConfig>>,
+    focus: RwSignal<Focus>,
+) -> impl View {
+    dyn_container(
+        move || agent.show_add_agent.get(),
+        move |show| {
+            if !show {
+                return empty().into_any();
+            }
+
+            let submit_agent = agent.clone();
+            let cancel_agent = agent.clone();
+
+            stack((
+                form_input(
+                    agent.new_agent_name_input.clone(),
+                    "Agent name",
+                    focus,
+                    config,
+                ),
+                form_input(
+                    agent.new_agent_command_input.clone(),
+                    "Command, e.g. gemini --experimental-acp",
+                    focus,
+                    config,
+                ),
+                h_stack((
+                    action_button(
+                        "Add".to_string(),
+                        move || submit_agent.submit_new_agent(),
+                        config,
+                        true,
+                    ),
+                    action_button(
+                        "Cancel".to_string(),
+                        move || cancel_agent.show_add_agent.set(false),
+                        config,
+                        false,
+                    ),
+                ))
+                .style(|s| s.gap(6.0)),
+            ))
+            .style(move |s| {
+                let config = config.get();
+                s.width_full()
+                    .flex_col()
+                    .gap(4.0)
+                    .padding(6.0)
+                    .border(1.0)
+                    .border_radius(5.0)
+                    .border_color(config.color(LapceColor::LAPCE_BORDER))
+                    .background(config.color(LapceColor::PANEL_BACKGROUND))
+            })
+            .into_any()
+        },
+    )
+}
+
+fn form_input(
+    editor: EditorData,
+    placeholder: &'static str,
+    focus: RwSignal<Focus>,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let input = TextInputBuilder::new()
+        .is_focused(move || focus.get() == Focus::Panel(PanelKind::Agent))
+        .build_editor(editor)
+        .placeholder(move || placeholder.to_string())
+        .keyboard_navigable();
+
+    let input_id = input.id();
+    container(input.on_event_cont(EventListener::PointerDown, move |_| {
+        focus.set(Focus::Panel(PanelKind::Agent));
+        input_id.request_focus();
+    }))
+    .style(move |s| {
+        let config = config.get();
+        s.width_full()
+            .min_width(0.0)
+            .border(1.0)
+            .border_radius(4.0)
+            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .background(config.color(LapceColor::EDITOR_BACKGROUND))
+    })
+}
+
+fn options_panel(
+    agent: AgentData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    dyn_container(
+        move || {
+            (
+                agent.models.get(),
+                agent.modes.get(),
+                agent.config_options.get(),
+            )
+        },
+        move |(models, modes, config_options)| {
+            let mut rows: Vec<AnyView> = Vec::new();
+
+            if let Some(models) = models {
+                if let Some(row) = model_row(models, agent.clone(), config) {
+                    rows.push(row);
+                }
+            }
+            if let Some(modes) = modes {
+                if let Some(row) = mode_row(modes, agent.clone(), config) {
+                    rows.push(row);
+                }
+            }
+            for option in config_options {
+                if let Some(row) = config_option_row(option, agent.clone(), config) {
+                    rows.push(row);
+                }
+            }
+
+            if rows.is_empty() {
+                return empty().into_any();
+            }
+
+            scroll(
+                stack_from_iter(rows).style(|s| s.flex_col().width_full().gap(4.0)),
+            )
+            .scroll_style(|s| s.hide_bars(true))
+            .style(|s| s.width_full().max_height(150.0))
+            .into_any()
+        },
+    )
+}
+
+fn model_row(
+    state: AgentChoiceState,
+    agent: AgentData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> Option<AnyView> {
+    let items: im::Vector<ModelChoice> = state
+        .available
+        .into_iter()
+        .map(|model| ModelChoice {
+            id: model.id,
+            name: model.name,
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    let current = items
+        .iter()
+        .find(|choice| choice.id == state.current)
+        .cloned()
+        .or_else(|| items.get(0).cloned())?;
+
+    let dropdown = selector(
+        current,
+        items,
+        move |choice| agent.select_model(choice.id),
+        config,
+    );
+
+    Some(
+        h_stack((option_label("Model".to_string(), config), dropdown))
+            .style(|s| s.width_full().items_center().gap(6.0))
+            .into_any(),
+    )
+}
+
+fn mode_row(
+    state: AgentChoiceState,
+    agent: AgentData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> Option<AnyView> {
+    let items: im::Vector<ModelChoice> = state
+        .available
+        .into_iter()
+        .map(|mode| ModelChoice {
+            id: mode.id,
+            name: mode.name,
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    let current = items
+        .iter()
+        .find(|choice| choice.id == state.current)
+        .cloned()
+        .or_else(|| items.get(0).cloned())?;
+
+    let dropdown = selector(
+        current,
+        items,
+        move |choice| agent.select_mode(choice.id),
+        config,
+    );
+
+    Some(
+        h_stack((option_label("Mode".to_string(), config), dropdown))
+            .style(|s| s.width_full().items_center().gap(6.0))
+            .into_any(),
+    )
+}
+
+fn config_option_row(
+    option: AgentConfigOption,
+    agent: AgentData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> Option<AnyView> {
+    let AgentConfigOption { id, name, kind, .. } = option;
+
+    match kind {
+        AgentConfigOptionKind::Select { current, options } => {
+            let items: im::Vector<ConfigValueChoice> = options
+                .into_iter()
+                .map(|option| ConfigValueChoice {
+                    value: option.value,
+                    name: option.name,
+                })
+                .collect();
+            if items.is_empty() {
+                return None;
+            }
+            let current = items
+                .iter()
+                .find(|choice| choice.value == current)
+                .cloned()
+                .or_else(|| items.get(0).cloned())?;
+
+            let config_id = id;
+            let dropdown = selector(
+                current,
+                items,
+                move |choice| {
+                    agent.set_config_option(
+                        &config_id,
+                        AgentConfigValue::Select(choice.value),
+                    )
+                },
+                config,
+            );
+
+            Some(
+                h_stack((option_label(name, config), dropdown))
+                    .style(|s| s.width_full().items_center().gap(6.0))
+                    .into_any(),
+            )
+        }
+        AgentConfigOptionKind::Boolean { current } => {
+            let config_id = id;
+            let label = if current { "On" } else { "Off" };
+
+            Some(
+                h_stack((
+                    option_label(name, config),
+                    action_button(
+                        label.to_string(),
+                        move || {
+                            agent.set_config_option(
+                                &config_id,
+                                AgentConfigValue::Boolean(!current),
+                            )
+                        },
+                        config,
+                        current,
+                    ),
+                ))
+                .style(|s| s.width_full().items_center().gap(6.0))
+                .into_any(),
+            )
+        }
+    }
 }
 
 fn message_view(
@@ -516,39 +984,44 @@ fn composer(
         input_id.request_focus();
     });
 
+    let config_agent = agent.clone();
     let send_agent = agent.clone();
     let send_input_id = input_id;
 
-    h_stack((
-        container(
-            scroll(input)
-                .scroll_style(|s| s.hide_bars(true))
-                .style(|s| s.width_full().min_height(0.0)),
-        )
-        .style(move |s| {
-            let config = config.get();
-            s.flex_grow(1.0f32)
-                .min_width(0.0)
-                .min_height(34.0)
-                .border(1.0)
-                .border_radius(6.0)
-                .border_color(config.color(LapceColor::LAPCE_BORDER))
-                .background(config.color(LapceColor::EDITOR_BACKGROUND))
-        }),
-        action_button(
-            "Send".to_string(),
-            move || {
-                send_agent.submit_input();
-                send_input_id.request_focus();
-            },
-            config,
-            true,
-        ),
+    stack((
+        config_bar(config_agent, config, focus),
+        h_stack((
+            container(
+                scroll(input)
+                    .scroll_style(|s| s.hide_bars(true))
+                    .style(|s| s.width_full().min_height(0.0)),
+            )
+            .style(move |s| {
+                let config = config.get();
+                s.flex_grow(1.0f32)
+                    .min_width(0.0)
+                    .min_height(34.0)
+                    .border(1.0)
+                    .border_radius(6.0)
+                    .border_color(config.color(LapceColor::LAPCE_BORDER))
+                    .background(config.color(LapceColor::EDITOR_BACKGROUND))
+            }),
+            action_button(
+                "Send".to_string(),
+                move || {
+                    send_agent.submit_input();
+                    send_input_id.request_focus();
+                },
+                config,
+                true,
+            ),
+        ))
+        .style(|s| s.width_full().items_end().gap(6.0)),
     ))
     .style(move |s| {
         let config = config.get();
         s.width_full()
-            .items_end()
+            .flex_col()
             .gap(6.0)
             .padding(8.0)
             .border_top(1.0)
