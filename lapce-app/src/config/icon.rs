@@ -33,6 +33,7 @@ impl LapceIcons {
     pub const WARNING: &'static str = "warning";
     pub const TERMINAL: &'static str = "terminal";
     pub const AGENT: &'static str = "agent";
+    pub const COPY: &'static str = "copy";
     pub const SETTINGS: &'static str = "settings";
     pub const LIGHTBULB: &'static str = "lightbulb";
     pub const EXTENSIONS: &'static str = "extensions";

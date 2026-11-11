@@ -10,6 +10,7 @@
 - Added an Agent Chat panel that talks to ACP (Agent Client Protocol) compatible agents
 - Agent Chat supports multiple ACP agent profiles and model/mode/config option selection
 - Agent Chat handles tool approvals, ACP elicitation questions and task lists
+- Agent Chat messages can be copied, thinking/tool output can be collapsed, and token usage is shown
 
 ### Bug Fixes
 

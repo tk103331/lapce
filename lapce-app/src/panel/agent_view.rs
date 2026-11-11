@@ -1,6 +1,9 @@
 use std::{rc::Rc, sync::Arc};
 
-use floem::views::dropdown::Dropdown;
+use floem::views::{
+    dropdown::Dropdown,
+    editor::{core::register::Clipboard, text::SystemClipboard},
+};
 use floem::{
     AnyView, IntoView, View,
     event::EventListener,
@@ -21,9 +24,10 @@ use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     agent::{
         AgentChoiceState, AgentConfigOption, AgentConfigOptionKind,
-        AgentConfigValue, AgentData, AgentMessage, AgentQuestionAnswer,
-        AgentQuestionField, AgentQuestionKind, AgentQuestionValue, AgentRole,
-        AgentStatus, AgentTask, PendingPermission,
+        AgentConfigValue, AgentContextUsage, AgentCost, AgentData, AgentMessage,
+        AgentQuestionAnswer, AgentQuestionField, AgentQuestionKind,
+        AgentQuestionValue, AgentRole, AgentStatus, AgentTask, AgentUsage,
+        PendingPermission,
     },
     app::clickable_icon,
     command::{CommandExecuted, CommandKind},
@@ -180,6 +184,83 @@ fn option_label(text: String, config: ReadSignal<Arc<LapceConfig>>) -> impl View
     })
 }
 
+fn copy_text(text: String) {
+    let mut clipboard = SystemClipboard::new();
+    clipboard.put_string(text);
+}
+
+fn copy_icon(
+    text: impl Fn() -> String + 'static,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    clickable_icon(
+        || LapceIcons::COPY,
+        move || copy_text(text()),
+        || false,
+        || false,
+        || "Copy",
+        config,
+    )
+}
+
+fn preview_text(text: &str) -> String {
+    let text = text.trim();
+    let first = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut chars = first.chars();
+    let mut preview: String = chars.by_ref().take(120).collect();
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_cost(cost: &AgentCost) -> String {
+    if cost.currency == "USD" {
+        format!("${:.4}", cost.amount)
+    } else {
+        format!("{:.4} {}", cost.amount, cost.currency)
+    }
+}
+
+fn usage_summary(
+    usage: Option<&AgentUsage>,
+    context: Option<&AgentContextUsage>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(usage) = usage {
+        if usage.total_tokens > 0 {
+            parts.push(format!("{} tokens", format_token_count(usage.total_tokens)));
+        }
+    }
+    if let Some(context) = context {
+        if context.size > 0 {
+            parts.push(format!(
+                "ctx {}/{}",
+                format_token_count(context.used),
+                format_token_count(context.size)
+            ));
+        }
+        if let Some(cost) = &context.cost {
+            parts.push(format_cost(cost));
+        }
+    }
+    parts.join(" · ")
+}
+
 pub fn agent_panel(
     window_tab_data: Rc<WindowTabData>,
     _position: PanelPosition,
@@ -213,6 +294,13 @@ fn header(agent: AgentData, config: ReadSignal<Arc<LapceConfig>>) -> impl View {
     let name_agent = agent.clone();
     let status_label_agent = agent.clone();
     let status_style_agent = agent.clone();
+    let usage_agent = agent.clone();
+    let usage_text = create_memo(move |_| {
+        usage_summary(
+            usage_agent.usage.get().as_ref(),
+            usage_agent.context_usage.get().as_ref(),
+        )
+    });
     let new_session = agent.clone();
     let stop = agent.clone();
     let restart = agent.clone();
@@ -247,6 +335,15 @@ fn header(agent: AgentData, config: ReadSignal<Arc<LapceConfig>>) -> impl View {
                     .text_ellipsis()
                     .min_width(0.0)
                     .selectable(false)
+            }),
+            label(move || usage_text.get()).style(move |s| {
+                let config = config.get();
+                s.font_size(config.ui.font_size() as f32 - 1.0)
+                    .color(config.color(LapceColor::EDITOR_DIM))
+                    .text_ellipsis()
+                    .min_width(0.0)
+                    .selectable(false)
+                    .apply_if(usage_text.get().is_empty(), |s| s.hide())
             }),
         ))
         .style(|s| s.flex_col().flex_grow(1.0f32).min_width(0.0)),
@@ -1029,72 +1126,149 @@ fn config_option_row(
 
 fn message_view(
     message: RwSignal<AgentMessage>,
-    _agent: AgentData,
+    agent: AgentData,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> AnyView {
-    stack((
-        label(move || role_title(message.get().role).to_string()).style(move |s| {
-            let config = config.get();
-            let color = match message.get().role {
-                AgentRole::User => config.color(LapceColor::EDITOR_CARET),
-                AgentRole::Error => config.color(LapceColor::LAPCE_ERROR),
-                AgentRole::Notice => config.color(LapceColor::LAPCE_WARN),
-                AgentRole::Thought => config.color(LapceColor::EDITOR_DIM),
-                AgentRole::Tool | AgentRole::Plan => {
-                    config.color(LapceColor::EDITOR_DIM)
-                }
-                AgentRole::Assistant => config.color(LapceColor::EDITOR_FOREGROUND),
-            };
-            s.font_size(config.ui.font_size() as f32 - 1.0)
-                .color(color)
-                .selectable(false)
-                .padding_bottom(2.0)
-                .apply_if(message.get().role == AgentRole::Tool, |s| s.hide())
-        }),
-        dyn_container(
-            move || message.get(),
-            move |message| match message.role {
-                AgentRole::Tool => tool_message(message, config).into_any(),
-                AgentRole::Error => label(move || message.content.clone())
-                    .style(move |s| {
-                        s.width_full()
-                            .color(config.get().color(LapceColor::LAPCE_ERROR))
-                            .selectable(true)
-                    })
-                    .into_any(),
-                AgentRole::User => markdown_text(message.content, config).into_any(),
-                AgentRole::Assistant => {
-                    markdown_text(message.content, config).into_any()
-                }
-                AgentRole::Thought => markdown_text(message.content, config)
-                    .style(move |s| {
-                        s.color(config.get().color(LapceColor::EDITOR_DIM))
-                    })
-                    .into_any(),
-                AgentRole::Plan => markdown_text(message.content, config).into_any(),
-                AgentRole::Notice => label(move || message.content.clone())
-                    .style(move |s| {
-                        s.width_full()
-                            .color(config.get().color(LapceColor::LAPCE_WARN))
-                            .selectable(true)
-                    })
-                    .into_any(),
-            },
-        ),
-    ))
-    .style(move |s| {
-        let config = config.get();
-        s.width_full()
-            .flex_col()
-            .padding_horiz(10.0)
-            .padding_vert(7.0)
-            .border_bottom(1.0)
-            .border_color(config.color(LapceColor::LAPCE_BORDER))
-            .apply_if(message.get().role == AgentRole::User, |s| {
-                s.background(config.color(LapceColor::PANEL_CURRENT_BACKGROUND))
+    let message_id = message.get_untracked().id;
+    let is_thought = message.get_untracked().role == AgentRole::Thought;
+    let is_tool = message.get_untracked().role == AgentRole::Tool;
+
+    let role_label: AnyView = if is_tool {
+        empty().into_any()
+    } else {
+        label(move || role_title(message.get().role).to_string())
+            .style(move |s| {
+                let config = config.get();
+                let color = match message.get().role {
+                    AgentRole::User => config.color(LapceColor::EDITOR_CARET),
+                    AgentRole::Error => config.color(LapceColor::LAPCE_ERROR),
+                    AgentRole::Notice => config.color(LapceColor::LAPCE_WARN),
+                    AgentRole::Thought => config.color(LapceColor::EDITOR_DIM),
+                    AgentRole::Tool | AgentRole::Plan => {
+                        config.color(LapceColor::EDITOR_DIM)
+                    }
+                    AgentRole::Assistant => {
+                        config.color(LapceColor::EDITOR_FOREGROUND)
+                    }
+                };
+                s.font_size(config.ui.font_size() as f32 - 1.0)
+                    .color(color)
+                    .selectable(false)
             })
-    })
-    .into_any()
+            .into_any()
+    };
+
+    let toggle: AnyView = if is_thought {
+        let toggle_agent = agent.clone();
+        let expanded = agent.expanded_thoughts;
+        dyn_container(
+            move || expanded.get().contains(&message_id),
+            move |expanded| {
+                let toggle_agent = toggle_agent.clone();
+                action_button(
+                    if expanded {
+                        "Hide".to_string()
+                    } else {
+                        "Show".to_string()
+                    },
+                    move || toggle_agent.toggle_thought(message_id),
+                    config,
+                    false,
+                )
+                .into_any()
+            },
+        )
+        .into_any()
+    } else {
+        empty().into_any()
+    };
+
+    let copy: AnyView = if is_tool {
+        empty().into_any()
+    } else {
+        let copy_message = message;
+        copy_icon(move || copy_message.get_untracked().content.clone(), config)
+            .into_any()
+    };
+
+    let header = h_stack((
+        role_label,
+        empty().style(|s| s.flex_grow(1.0)),
+        toggle,
+        copy,
+    ))
+    .style(|s| s.width_full().items_center().gap(4.0));
+
+    let body_agent = agent.clone();
+    let body = dyn_container(
+        move || {
+            (
+                message.get(),
+                body_agent.expanded_thoughts.get().contains(&message_id),
+            )
+        },
+        move |(message, expanded)| match message.role {
+            AgentRole::Tool => {
+                tool_message(message, agent.clone(), config).into_any()
+            }
+            AgentRole::Error => label(move || message.content.clone())
+                .style(move |s| {
+                    s.width_full()
+                        .color(config.get().color(LapceColor::LAPCE_ERROR))
+                        .selectable(true)
+                })
+                .into_any(),
+            AgentRole::User => markdown_text(message.content, config).into_any(),
+            AgentRole::Assistant => {
+                markdown_text(message.content, config).into_any()
+            }
+            AgentRole::Thought => {
+                if expanded {
+                    markdown_text(message.content, config)
+                        .style(move |s| {
+                            s.color(config.get().color(LapceColor::EDITOR_DIM))
+                        })
+                        .into_any()
+                } else {
+                    let preview = preview_text(&message.content);
+                    label(move || preview.clone())
+                        .style(move |s| {
+                            let config = config.get();
+                            s.width_full()
+                                .min_width(0.0)
+                                .text_ellipsis()
+                                .color(config.color(LapceColor::EDITOR_DIM))
+                                .font_size(config.ui.font_size() as f32 - 1.0)
+                                .selectable(false)
+                        })
+                        .into_any()
+                }
+            }
+            AgentRole::Plan => markdown_text(message.content, config).into_any(),
+            AgentRole::Notice => label(move || message.content.clone())
+                .style(move |s| {
+                    s.width_full()
+                        .color(config.get().color(LapceColor::LAPCE_WARN))
+                        .selectable(true)
+                })
+                .into_any(),
+        },
+    );
+
+    stack((header, body))
+        .style(move |s| {
+            let config = config.get();
+            s.width_full()
+                .flex_col()
+                .padding_horiz(10.0)
+                .padding_vert(7.0)
+                .border_bottom(1.0)
+                .border_color(config.color(LapceColor::LAPCE_BORDER))
+                .apply_if(message.get().role == AgentRole::User, |s| {
+                    s.background(config.color(LapceColor::PANEL_CURRENT_BACKGROUND))
+                })
+        })
+        .into_any()
 }
 
 fn role_title(role: AgentRole) -> &'static str {
@@ -1111,6 +1285,7 @@ fn role_title(role: AgentRole) -> &'static str {
 
 fn tool_message(
     message: AgentMessage,
+    agent: AgentData,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
     let Some(tool) = message.tool else {
@@ -1122,6 +1297,67 @@ fn tool_message(
     let kind = tool.kind.clone();
     let title = tool.title.clone();
     let content = tool.content.clone();
+    let tool_id = message.id;
+    let has_content = !content.is_empty();
+    let body_content = content.clone();
+    let copy_content = content;
+
+    let toggle_agent = agent.clone();
+    let expanded = agent.expanded_tools;
+    let toggle = dyn_container(
+        move || expanded.get().contains(&tool_id),
+        move |expanded| {
+            if !has_content {
+                return empty().into_any();
+            }
+            let toggle_agent = toggle_agent.clone();
+            action_button(
+                if expanded {
+                    "Hide".to_string()
+                } else {
+                    "Show".to_string()
+                },
+                move || toggle_agent.toggle_tool(tool_id),
+                config,
+                false,
+            )
+            .into_any()
+        },
+    );
+
+    let copy: AnyView = if has_content {
+        copy_icon(move || copy_content.clone(), config).into_any()
+    } else {
+        empty().into_any()
+    };
+
+    let body: AnyView = if has_content {
+        let body_agent = agent.clone();
+        dyn_container(
+            move || body_agent.expanded_tools.get().contains(&tool_id),
+            move |expanded| {
+                if expanded {
+                    markdown_text(body_content.clone(), config).into_any()
+                } else {
+                    let preview = preview_text(&body_content);
+                    label(move || preview.clone())
+                        .style(move |s| {
+                            let config = config.get();
+                            s.width_full()
+                                .min_width(0.0)
+                                .text_ellipsis()
+                                .color(config.color(LapceColor::EDITOR_DIM))
+                                .font_size(config.ui.font_size() as f32 - 1.0)
+                                .selectable(false)
+                        })
+                        .into_any()
+                }
+            },
+        )
+        .into_any()
+    } else {
+        empty().into_any()
+    };
 
     stack((
         h_stack((
@@ -1147,13 +1383,12 @@ fn tool_message(
                     .font_size(config.ui.font_size() as f32 - 1.0)
                     .selectable(false)
             }),
+            empty().style(|s| s.flex_grow(1.0)),
+            toggle,
+            copy,
         ))
-        .style(|s| s.items_center().gap(6.0)),
-        if content.is_empty() {
-            empty().into_any()
-        } else {
-            markdown_text(content, config).into_any()
-        },
+        .style(|s| s.width_full().items_center().gap(6.0)),
+        body,
     ))
     .style(move |s| {
         let config = config.get();

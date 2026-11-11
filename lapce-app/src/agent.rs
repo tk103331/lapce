@@ -204,6 +204,29 @@ pub struct AgentTask {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentUsage {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub thought_tokens: Option<u64>,
+    pub cached_read_tokens: Option<u64>,
+    pub cached_write_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentContextUsage {
+    pub used: u64,
+    pub size: u64,
+    pub cost: Option<AgentCost>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentCost {
+    pub amount: f64,
+    pub currency: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum AgentStatus {
     #[default]
     Idle,
@@ -293,6 +316,8 @@ struct Store {
     question: Option<AgentQuestion>,
     question_tx: Option<Sender<AgentQuestionAnswer>>,
     next_question_id: u64,
+    usage: Option<AgentUsage>,
+    context_usage: Option<AgentContextUsage>,
 }
 
 impl Store {
@@ -365,6 +390,8 @@ impl Store {
         self.models = None;
         self.modes = None;
         self.config_options.clear();
+        self.usage = None;
+        self.context_usage = None;
     }
 
     fn tool_call(
@@ -487,6 +514,10 @@ pub struct AgentData {
     pub tasks: RwSignal<im::Vector<AgentTask>>,
     pub question: RwSignal<Option<AgentQuestion>>,
     pub question_values: RwSignal<im::HashMap<String, AgentQuestionValue>>,
+    pub usage: RwSignal<Option<AgentUsage>>,
+    pub context_usage: RwSignal<Option<AgentContextUsage>>,
+    pub expanded_thoughts: RwSignal<im::HashSet<u64>>,
+    pub expanded_tools: RwSignal<im::HashSet<u64>>,
     pub profiles: RwSignal<im::Vector<AgentProfile>>,
     pub active_profile: RwSignal<String>,
     pub show_add_agent: RwSignal<bool>,
@@ -535,6 +566,10 @@ impl AgentData {
             tasks: cx.create_rw_signal(im::Vector::new()),
             question: cx.create_rw_signal(None),
             question_values: cx.create_rw_signal(im::HashMap::new()),
+            usage: cx.create_rw_signal(None),
+            context_usage: cx.create_rw_signal(None),
+            expanded_thoughts: cx.create_rw_signal(im::HashSet::new()),
+            expanded_tools: cx.create_rw_signal(im::HashSet::new()),
             profiles: cx.create_rw_signal(profiles),
             active_profile: cx.create_rw_signal(active_profile.name.clone()),
             show_add_agent: cx.create_rw_signal(false),
@@ -571,6 +606,8 @@ impl AgentData {
             config_options,
             tasks,
             question,
+            usage,
+            context_usage,
             restart,
         ) = {
             let mut store = self.store.lock();
@@ -593,6 +630,8 @@ impl AgentData {
                     .collect::<im::Vector<_>>(),
                 store.tasks.iter().cloned().collect::<im::Vector<_>>(),
                 store.question.clone(),
+                store.usage.clone(),
+                store.context_usage.clone(),
                 restart,
             )
         };
@@ -621,6 +660,12 @@ impl AgentData {
         if self.question.get_untracked() != question {
             self.prepare_question(question.as_ref());
             self.question.set(question);
+        }
+        if self.usage.get_untracked() != usage {
+            self.usage.set(usage);
+        }
+        if self.context_usage.get_untracked() != context_usage {
+            self.context_usage.set(context_usage);
         }
 
         self.messages.update(|existing| {
@@ -1109,6 +1154,22 @@ impl AgentData {
         self.notifier.notify();
     }
 
+    pub fn toggle_thought(&self, id: u64) {
+        self.expanded_thoughts.update(|expanded| {
+            if expanded.remove(&id).is_none() {
+                expanded.insert(id);
+            }
+        });
+    }
+
+    pub fn toggle_tool(&self, id: u64) {
+        self.expanded_tools.update(|expanded| {
+            if expanded.remove(&id).is_none() {
+                expanded.insert(id);
+            }
+        });
+    }
+
     fn send_command(&self, command: AgentCommand) {
         if let Some(sender) = self.sender.lock().as_ref() {
             let _ = sender.send(command);
@@ -1516,6 +1577,9 @@ impl ProtocolConnection {
     fn finish_prompt(&mut self, response: Value) -> Result<()> {
         match response_result(response) {
             Ok(result) => {
+                if let Some(usage) = parse_usage(&result["usage"]) {
+                    self.store.lock().usage = Some(usage);
+                }
                 let stop_reason = result
                     .get("stopReason")
                     .and_then(Value::as_str)
@@ -2050,6 +2114,13 @@ impl ProtocolConnection {
                         }
                     }
                 }
+                "usage_update" => {
+                    store.context_usage = Some(AgentContextUsage {
+                        used: update["used"].as_u64().unwrap_or(0),
+                        size: update["size"].as_u64().unwrap_or(0),
+                        cost: parse_cost(&update["cost"]),
+                    });
+                }
                 _ => {}
             }
         }
@@ -2203,6 +2274,33 @@ fn response_result(response: Value) -> Result<Value> {
         bail!("{message}{details}");
     }
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn parse_usage(value: &Value) -> Option<AgentUsage> {
+    if !value.is_object() {
+        return None;
+    }
+
+    Some(AgentUsage {
+        total_tokens: value["totalTokens"].as_u64().unwrap_or(0),
+        input_tokens: value["inputTokens"].as_u64().unwrap_or(0),
+        output_tokens: value["outputTokens"].as_u64().unwrap_or(0),
+        thought_tokens: value["thoughtTokens"].as_u64(),
+        cached_read_tokens: value["cachedReadTokens"].as_u64(),
+        cached_write_tokens: value["cachedWriteTokens"].as_u64(),
+    })
+}
+
+fn parse_cost(value: &Value) -> Option<AgentCost> {
+    let object = value.as_object()?;
+    Some(AgentCost {
+        amount: object.get("amount")?.as_f64()?,
+        currency: object
+            .get("currency")
+            .and_then(Value::as_str)
+            .unwrap_or("USD")
+            .to_string(),
+    })
 }
 
 fn parse_choice_state(
