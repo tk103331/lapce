@@ -6,7 +6,8 @@
 //! requests while the UI only has to talk to [`AgentData`].
 
 use std::{
-    collections::{HashMap, VecDeque},
+    cell::RefCell,
+    collections::{BTreeMap, HashMap, VecDeque},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
@@ -130,6 +131,78 @@ pub enum AgentConfigValue {
     Boolean(bool),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentQuestionOption {
+    pub value: String,
+    pub title: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentQuestionKind {
+    Text {
+        default: Option<String>,
+    },
+    Integer {
+        default: Option<i64>,
+        minimum: Option<f64>,
+        maximum: Option<f64>,
+    },
+    Number {
+        default: Option<f64>,
+        minimum: Option<f64>,
+        maximum: Option<f64>,
+    },
+    Boolean {
+        default: bool,
+    },
+    Select {
+        default: Option<String>,
+        options: Vec<AgentQuestionOption>,
+    },
+    MultiSelect {
+        default: Vec<String>,
+        options: Vec<AgentQuestionOption>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentQuestionField {
+    pub name: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub required: bool,
+    pub kind: AgentQuestionKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentQuestion {
+    pub id: u64,
+    pub message: String,
+    pub fields: Vec<AgentQuestionField>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentQuestionValue {
+    Select(String),
+    Boolean(bool),
+    Multi(Vec<String>),
+}
+
+#[derive(Clone, Debug)]
+pub enum AgentQuestionAnswer {
+    Accept(BTreeMap<String, Value>),
+    Decline,
+    Cancel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTask {
+    pub content: String,
+    pub status: String,
+    pub priority: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum AgentStatus {
     #[default]
@@ -138,6 +211,7 @@ pub enum AgentStatus {
     Ready,
     Thinking,
     WaitingForPermission,
+    WaitingForAnswer,
     Stopping,
     Failed(String),
     Stopped,
@@ -150,6 +224,7 @@ impl AgentStatus {
             AgentStatus::Starting
                 | AgentStatus::Thinking
                 | AgentStatus::WaitingForPermission
+                | AgentStatus::WaitingForAnswer
                 | AgentStatus::Stopping
         )
     }
@@ -163,6 +238,7 @@ impl AgentStatus {
             AgentStatus::WaitingForPermission => {
                 "Waiting for permission".to_string()
             }
+            AgentStatus::WaitingForAnswer => "Waiting for your answer".to_string(),
             AgentStatus::Stopping => "Stopping…".to_string(),
             AgentStatus::Failed(_) => "Error".to_string(),
             AgentStatus::Stopped => "Stopped".to_string(),
@@ -208,12 +284,15 @@ struct Store {
     permission_tx: Option<Sender<Option<String>>>,
     assistant_message: Option<u64>,
     thought_message: Option<u64>,
-    plan_message: Option<u64>,
     tool_messages: HashMap<String, u64>,
     restart_requested: bool,
     models: Option<AgentChoiceState>,
     modes: Option<AgentChoiceState>,
     config_options: Vec<AgentConfigOption>,
+    tasks: Vec<AgentTask>,
+    question: Option<AgentQuestion>,
+    question_tx: Option<Sender<AgentQuestionAnswer>>,
+    next_question_id: u64,
 }
 
 impl Store {
@@ -263,10 +342,12 @@ impl Store {
     fn begin_turn(&mut self) {
         self.assistant_message = None;
         self.thought_message = None;
-        self.plan_message = None;
         self.tool_messages.clear();
         self.permission = None;
         self.permission_tx = None;
+        self.question = None;
+        self.question_tx = None;
+        self.tasks.clear();
         self.status = AgentStatus::Thinking;
     }
 
@@ -275,9 +356,11 @@ impl Store {
         self.tool_messages.clear();
         self.assistant_message = None;
         self.thought_message = None;
-        self.plan_message = None;
         self.permission = None;
         self.permission_tx = None;
+        self.question = None;
+        self.question_tx = None;
+        self.tasks.clear();
         self.status = AgentStatus::Idle;
         self.models = None;
         self.modes = None;
@@ -363,31 +446,22 @@ impl Store {
     }
 
     fn set_plan(&mut self, entries: &[Value]) {
-        let mut content = String::from("**Plan**\n");
-        for entry in entries {
-            let status = entry["status"].as_str().unwrap_or("pending");
-            let marker = match status {
-                "completed" => "✓",
-                "in_progress" => "→",
-                _ => "○",
-            };
-            content.push_str(&format!(
-                "{marker} {}\n",
-                entry["content"].as_str().unwrap_or_default()
-            ));
-        }
-
-        if let Some(message_id) = self.plan_message {
-            if let Some(message) =
-                self.messages.iter_mut().find(|m| m.id == message_id)
-            {
-                message.content = content;
-                return;
-            }
-        }
-
-        let message_id = self.push_message(AgentRole::Plan, content);
-        self.plan_message = Some(message_id);
+        self.tasks = entries
+            .iter()
+            .filter_map(|entry| {
+                Some(AgentTask {
+                    content: entry["content"].as_str()?.to_string(),
+                    status: entry["status"]
+                        .as_str()
+                        .unwrap_or("pending")
+                        .to_string(),
+                    priority: entry["priority"]
+                        .as_str()
+                        .unwrap_or("medium")
+                        .to_string(),
+                })
+            })
+            .collect();
     }
 
     fn error(&mut self, message: impl Into<String>) {
@@ -410,6 +484,9 @@ pub struct AgentData {
     pub models: RwSignal<Option<AgentChoiceState>>,
     pub modes: RwSignal<Option<AgentChoiceState>>,
     pub config_options: RwSignal<im::Vector<AgentConfigOption>>,
+    pub tasks: RwSignal<im::Vector<AgentTask>>,
+    pub question: RwSignal<Option<AgentQuestion>>,
+    pub question_values: RwSignal<im::HashMap<String, AgentQuestionValue>>,
     pub profiles: RwSignal<im::Vector<AgentProfile>>,
     pub active_profile: RwSignal<String>,
     pub show_add_agent: RwSignal<bool>,
@@ -421,6 +498,8 @@ pub struct AgentData {
     running: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
     profile: Arc<Mutex<Option<AgentProfile>>>,
+    editors: Editors,
+    question_inputs: Rc<RefCell<HashMap<String, EditorData>>>,
 }
 
 impl AgentData {
@@ -453,6 +532,9 @@ impl AgentData {
             models: cx.create_rw_signal(None),
             modes: cx.create_rw_signal(None),
             config_options: cx.create_rw_signal(im::Vector::new()),
+            tasks: cx.create_rw_signal(im::Vector::new()),
+            question: cx.create_rw_signal(None),
+            question_values: cx.create_rw_signal(im::HashMap::new()),
             profiles: cx.create_rw_signal(profiles),
             active_profile: cx.create_rw_signal(active_profile.name.clone()),
             show_add_agent: cx.create_rw_signal(false),
@@ -464,6 +546,8 @@ impl AgentData {
             running: Arc::new(AtomicBool::new(false)),
             epoch: Arc::new(AtomicU64::new(0)),
             profile: Arc::new(Mutex::new(Some(active_profile))),
+            editors,
+            question_inputs: Rc::new(RefCell::new(HashMap::new())),
         };
 
         let data_for_effect = data.clone();
@@ -485,6 +569,8 @@ impl AgentData {
             models,
             modes,
             config_options,
+            tasks,
+            question,
             restart,
         ) = {
             let mut store = self.store.lock();
@@ -505,6 +591,8 @@ impl AgentData {
                     .iter()
                     .cloned()
                     .collect::<im::Vector<_>>(),
+                store.tasks.iter().cloned().collect::<im::Vector<_>>(),
+                store.question.clone(),
                 restart,
             )
         };
@@ -526,6 +614,13 @@ impl AgentData {
         }
         if self.config_options.get_untracked() != config_options {
             self.config_options.set(config_options);
+        }
+        if self.tasks.get_untracked() != tasks {
+            self.tasks.set(tasks);
+        }
+        if self.question.get_untracked() != question {
+            self.prepare_question(question.as_ref());
+            self.question.set(question);
         }
 
         self.messages.update(|existing| {
@@ -606,7 +701,9 @@ impl AgentData {
 
         {
             let mut store = self.store.lock();
-            if store.status != AgentStatus::WaitingForPermission {
+            if store.status != AgentStatus::WaitingForPermission
+                && store.status != AgentStatus::WaitingForAnswer
+            {
                 store.status = AgentStatus::Stopping;
             }
         }
@@ -800,6 +897,216 @@ impl AgentData {
             config_id: config_id.to_string(),
             value,
         });
+    }
+
+    fn prepare_question(&self, question: Option<&AgentQuestion>) {
+        self.clear_question_ui();
+        let Some(question) = question else {
+            return;
+        };
+
+        let mut values = im::HashMap::new();
+        {
+            let mut inputs = self.question_inputs.borrow_mut();
+            for field in &question.fields {
+                match &field.kind {
+                    AgentQuestionKind::Text { default } => {
+                        let editor = self
+                            .editors
+                            .make_local(self.common.scope, self.common.clone());
+                        if let Some(default) = default {
+                            editor.doc().reload(
+                                lapce_xi_rope::Rope::from(default.clone()),
+                                true,
+                            );
+                        }
+                        inputs.insert(field.name.clone(), editor);
+                    }
+                    AgentQuestionKind::Integer { default, .. } => {
+                        let editor = self
+                            .editors
+                            .make_local(self.common.scope, self.common.clone());
+                        if let Some(default) = default {
+                            editor.doc().reload(
+                                lapce_xi_rope::Rope::from(default.to_string()),
+                                true,
+                            );
+                        }
+                        inputs.insert(field.name.clone(), editor);
+                    }
+                    AgentQuestionKind::Number { default, .. } => {
+                        let editor = self
+                            .editors
+                            .make_local(self.common.scope, self.common.clone());
+                        if let Some(default) = default {
+                            editor.doc().reload(
+                                lapce_xi_rope::Rope::from(default.to_string()),
+                                true,
+                            );
+                        }
+                        inputs.insert(field.name.clone(), editor);
+                    }
+                    AgentQuestionKind::Boolean { default } => {
+                        values.insert(
+                            field.name.clone(),
+                            AgentQuestionValue::Boolean(*default),
+                        );
+                    }
+                    AgentQuestionKind::Select { default, options } => {
+                        let value = default
+                            .clone()
+                            .or_else(|| {
+                                options.first().map(|option| option.value.clone())
+                            })
+                            .unwrap_or_default();
+                        values.insert(
+                            field.name.clone(),
+                            AgentQuestionValue::Select(value),
+                        );
+                    }
+                    AgentQuestionKind::MultiSelect { default, .. } => {
+                        values.insert(
+                            field.name.clone(),
+                            AgentQuestionValue::Multi(default.clone()),
+                        );
+                    }
+                }
+            }
+        }
+        self.question_values.set(values);
+    }
+
+    fn clear_question_ui(&self) {
+        let mut inputs = self.question_inputs.borrow_mut();
+        for (_, editor) in inputs.drain() {
+            self.editors.remove(editor.id());
+        }
+        self.question_values.set(im::HashMap::new());
+    }
+
+    pub fn question_input(&self, name: &str) -> Option<EditorData> {
+        self.question_inputs.borrow().get(name).cloned()
+    }
+
+    pub fn set_question_select(&self, name: &str, value: String) {
+        self.question_values.update(|values| {
+            values.insert(name.to_string(), AgentQuestionValue::Select(value));
+        });
+    }
+
+    pub fn toggle_question_bool(&self, name: &str) {
+        self.question_values.update(|values| {
+            let current =
+                matches!(values.get(name), Some(AgentQuestionValue::Boolean(true)));
+            values.insert(name.to_string(), AgentQuestionValue::Boolean(!current));
+        });
+    }
+
+    pub fn toggle_question_multi(&self, name: &str, value: String) {
+        self.question_values.update(|values| {
+            let current = match values.get(name) {
+                Some(AgentQuestionValue::Multi(values)) => values.clone(),
+                _ => Vec::new(),
+            };
+            let mut next = current;
+            if let Some(index) = next.iter().position(|item| item == &value) {
+                next.remove(index);
+            } else {
+                next.push(value);
+            }
+            values.insert(name.to_string(), AgentQuestionValue::Multi(next));
+        });
+    }
+
+    pub fn submit_question_answer(&self) {
+        let Some(question) = self.question.get_untracked() else {
+            return;
+        };
+        let values = self.question_values.get_untracked();
+        let inputs = self.question_inputs.borrow();
+        let mut content = BTreeMap::new();
+
+        for field in &question.fields {
+            let text = inputs.get(&field.name).map(|editor| {
+                editor
+                    .doc()
+                    .buffer
+                    .with(|buffer| buffer.to_string())
+                    .trim()
+                    .to_string()
+            });
+
+            match &field.kind {
+                AgentQuestionKind::Text { .. } => {
+                    if let Some(text) = text {
+                        if !text.is_empty() || field.required {
+                            content.insert(field.name.clone(), Value::String(text));
+                        }
+                    }
+                }
+                AgentQuestionKind::Integer { .. } => {
+                    if let Some(text) = text {
+                        if let Ok(value) = text.parse::<i64>() {
+                            content.insert(field.name.clone(), Value::from(value));
+                        }
+                    }
+                }
+                AgentQuestionKind::Number { .. } => {
+                    if let Some(text) = text {
+                        if let Ok(value) = text.parse::<f64>() {
+                            content.insert(field.name.clone(), Value::from(value));
+                        }
+                    }
+                }
+                AgentQuestionKind::Boolean { .. } => {
+                    let value = matches!(
+                        values.get(&field.name),
+                        Some(AgentQuestionValue::Boolean(true))
+                    );
+                    content.insert(field.name.clone(), Value::Bool(value));
+                }
+                AgentQuestionKind::Select { .. } => {
+                    if let Some(AgentQuestionValue::Select(value)) =
+                        values.get(&field.name)
+                    {
+                        if !value.is_empty() || field.required {
+                            content.insert(
+                                field.name.clone(),
+                                Value::String(value.clone()),
+                            );
+                        }
+                    }
+                }
+                AgentQuestionKind::MultiSelect { .. } => {
+                    if let Some(AgentQuestionValue::Multi(values)) =
+                        values.get(&field.name)
+                    {
+                        content.insert(
+                            field.name.clone(),
+                            Value::Array(
+                                values.iter().cloned().map(Value::String).collect(),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        drop(inputs);
+
+        self.answer_question(AgentQuestionAnswer::Accept(content));
+    }
+
+    pub fn answer_question(&self, answer: AgentQuestionAnswer) {
+        {
+            let mut store = self.store.lock();
+            if let Some(sender) = store.question_tx.take() {
+                let _ = sender.send(answer);
+            }
+            store.question = None;
+            store.status = AgentStatus::Thinking;
+        }
+        self.clear_question_ui();
+        self.notifier.notify();
     }
 
     fn send_command(&self, command: AgentCommand) {
@@ -1042,6 +1349,9 @@ impl ProtocolConnection {
                         "writeTextFile": true,
                     },
                     "terminal": false,
+                    "elicitation": {
+                        "form": {},
+                    },
                 },
                 "clientInfo": {
                     "name": "Lapce",
@@ -1407,6 +1717,9 @@ impl ProtocolConnection {
             "session/request_permission" => {
                 self.handle_permission_request(id, &params, commands)
             }
+            "elicitation/create" => {
+                self.handle_elicitation_request(id, &params, commands)
+            }
             "fs/read_text_file" => {
                 self.handle_read_file(id, &params);
                 Ok(Flow::Continue)
@@ -1555,6 +1868,99 @@ impl ProtocolConnection {
         self.notifier.notify();
 
         self.respond_permission(id, option)?;
+        Ok(Flow::Continue)
+    }
+
+    fn handle_elicitation_request(
+        &mut self,
+        id: Value,
+        params: &Value,
+        commands: Option<&Receiver<AgentCommand>>,
+    ) -> Result<Flow> {
+        let mode = params["mode"].as_str().unwrap_or("form");
+        if mode != "form" {
+            self.write_response(id, json!({ "action": "decline" }))?;
+            return Ok(Flow::Continue);
+        }
+
+        let message = params["message"]
+            .as_str()
+            .unwrap_or("The agent needs your input")
+            .to_string();
+        let fields = parse_question_fields(&params["requestedSchema"]);
+        if fields.is_empty() {
+            self.write_response(id, json!({ "action": "decline" }))?;
+            return Ok(Flow::Continue);
+        }
+
+        let (sender, receiver) = bounded(1);
+        {
+            let mut store = self.store.lock();
+            store.next_question_id += 1;
+            let question_id = store.next_question_id;
+            store.question = Some(AgentQuestion {
+                id: question_id,
+                message,
+                fields,
+            });
+            store.question_tx = Some(sender);
+            store.status = AgentStatus::WaitingForAnswer;
+        }
+        self.notifier.notify();
+
+        let answer = loop {
+            let choice = match commands.cloned() {
+                Some(commands) => select! {
+                    recv(receiver) -> answer => Some(answer.map_err(|_| ())),
+                    recv(commands) -> command => {
+                        match command {
+                            Ok(AgentCommand::Shutdown) | Err(_) => Some(Err(())),
+                            Ok(AgentCommand::Cancel) => {
+                                self.cancel_turn()?;
+                                Some(Ok(AgentQuestionAnswer::Cancel))
+                            }
+                            Ok(AgentCommand::SetModel(_))
+                            | Ok(AgentCommand::SetMode(_))
+                            | Ok(AgentCommand::SetConfigOption { .. })
+                            | Ok(AgentCommand::NewSession)
+                            | Ok(AgentCommand::Prompt(_)) => None,
+                        }
+                    }
+                },
+                None => Some(receiver.recv().map_err(|_| ())),
+            };
+
+            let Some(choice) = choice else {
+                continue;
+            };
+            match choice {
+                Ok(answer) => break answer,
+                Err(()) => {
+                    self.store.lock().question = None;
+                    self.notifier.notify();
+                    self.write_response(id, json!({ "action": "cancel" }))?;
+                    return Ok(Flow::Shutdown);
+                }
+            }
+        };
+
+        {
+            let mut store = self.store.lock();
+            store.question = None;
+            store.question_tx = None;
+            store.status = AgentStatus::Thinking;
+        }
+        self.notifier.notify();
+
+        let response = match answer {
+            AgentQuestionAnswer::Accept(content) => json!({
+                "action": "accept",
+                "content": content,
+            }),
+            AgentQuestionAnswer::Decline => json!({ "action": "decline" }),
+            AgentQuestionAnswer::Cancel => json!({ "action": "cancel" }),
+        };
+        self.write_response(id, response)?;
         Ok(Flow::Continue)
     }
 
@@ -1925,6 +2331,131 @@ fn parse_config_value_option(value: &Value) -> Option<AgentConfigValueOption> {
         name,
         description,
     })
+}
+
+fn parse_question_fields(schema: &Value) -> Vec<AgentQuestionField> {
+    let Some(properties) = schema["properties"].as_object() else {
+        return Vec::new();
+    };
+    let required: Vec<String> = schema["required"]
+        .as_array()
+        .map(|required| {
+            required
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    properties
+        .iter()
+        .filter_map(|(name, property)| {
+            parse_question_field(
+                name,
+                property,
+                required.iter().any(|required| required == name),
+            )
+        })
+        .collect()
+}
+
+fn parse_question_field(
+    name: &str,
+    property: &Value,
+    required: bool,
+) -> Option<AgentQuestionField> {
+    let title = property["title"].as_str().unwrap_or(name).to_string();
+    let description = property["description"].as_str().map(str::to_string);
+
+    let kind = match property["type"].as_str()? {
+        "string" => {
+            let options = parse_question_options(&property["oneOf"])
+                .or_else(|| parse_question_options(&property["enum"]))
+                .unwrap_or_default();
+            if options.is_empty() {
+                AgentQuestionKind::Text {
+                    default: property["default"].as_str().map(str::to_string),
+                }
+            } else {
+                AgentQuestionKind::Select {
+                    default: property["default"].as_str().map(str::to_string),
+                    options,
+                }
+            }
+        }
+        "integer" => AgentQuestionKind::Integer {
+            default: property["default"].as_i64(),
+            minimum: property["minimum"].as_f64(),
+            maximum: property["maximum"].as_f64(),
+        },
+        "number" => AgentQuestionKind::Number {
+            default: property["default"].as_f64(),
+            minimum: property["minimum"].as_f64(),
+            maximum: property["maximum"].as_f64(),
+        },
+        "boolean" => AgentQuestionKind::Boolean {
+            default: property["default"].as_bool().unwrap_or(false),
+        },
+        "array" => {
+            let options = parse_question_options(&property["items"]["anyOf"])
+                .or_else(|| parse_question_options(&property["items"]["enum"]))
+                .unwrap_or_default();
+            let default = property["default"]
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            AgentQuestionKind::MultiSelect { default, options }
+        }
+        _ => return None,
+    };
+
+    Some(AgentQuestionField {
+        name: name.to_string(),
+        title,
+        description,
+        required,
+        kind,
+    })
+}
+
+fn parse_question_options(value: &Value) -> Option<Vec<AgentQuestionOption>> {
+    let values = value.as_array()?;
+    let options: Vec<AgentQuestionOption> = values
+        .iter()
+        .filter_map(|item| {
+            if let Some(value) = item.as_str() {
+                return Some(AgentQuestionOption {
+                    value: value.to_string(),
+                    title: value.to_string(),
+                    description: None,
+                });
+            }
+
+            let value = item["const"].as_str().or_else(|| item["value"].as_str())?;
+            let title = item["title"]
+                .as_str()
+                .or_else(|| item["name"].as_str())
+                .unwrap_or(value);
+            Some(AgentQuestionOption {
+                value: value.to_string(),
+                title: title.to_string(),
+                description: item["description"].as_str().map(str::to_string),
+            })
+        })
+        .collect();
+
+    if options.is_empty() {
+        None
+    } else {
+        Some(options)
+    }
 }
 
 fn truncate_tool_output(mut content: String) -> String {

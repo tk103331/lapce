@@ -21,8 +21,9 @@ use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     agent::{
         AgentChoiceState, AgentConfigOption, AgentConfigOptionKind,
-        AgentConfigValue, AgentData, AgentMessage, AgentRole, AgentStatus,
-        PendingPermission,
+        AgentConfigValue, AgentData, AgentMessage, AgentQuestionAnswer,
+        AgentQuestionField, AgentQuestionKind, AgentQuestionValue, AgentRole,
+        AgentStatus, AgentTask, PendingPermission,
     },
     app::clickable_icon,
     command::{CommandExecuted, CommandKind},
@@ -88,6 +89,24 @@ impl std::fmt::Display for ConfigValueChoice {
 impl SelectorItem for ConfigValueChoice {
     fn selector_label(&self) -> String {
         self.name.clone()
+    }
+}
+
+#[derive(Clone)]
+struct QuestionChoice {
+    value: String,
+    title: String,
+}
+
+impl std::fmt::Display for QuestionChoice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} ▾", self.title)
+    }
+}
+
+impl SelectorItem for QuestionChoice {
+    fn selector_label(&self) -> String {
+        self.title.clone()
     }
 }
 
@@ -172,8 +191,10 @@ pub fn agent_panel(
 
     stack((
         header(agent.clone(), config),
+        task_list(agent.clone(), config),
         conversation(agent.clone(), config),
         permission_view(agent.clone(), config),
+        question_view(agent.clone(), config, focus),
         composer(agent, config, focus),
     ))
     .on_event_cont(EventListener::PointerDown, move |_| {
@@ -215,7 +236,8 @@ fn header(agent: AgentData, config: ReadSignal<Arc<LapceConfig>>) -> impl View {
                 let config = config.get();
                 let color = match status_style_agent.status.get() {
                     AgentStatus::Failed(_) => config.color(LapceColor::LAPCE_ERROR),
-                    AgentStatus::WaitingForPermission => {
+                    AgentStatus::WaitingForPermission
+                    | AgentStatus::WaitingForAnswer => {
                         config.color(LapceColor::LAPCE_WARN)
                     }
                     _ => config.color(LapceColor::EDITOR_DIM),
@@ -355,6 +377,319 @@ fn conversation(
             .width_full()
     })
     .debug_name("Agent Conversation")
+}
+
+fn task_list(agent: AgentData, config: ReadSignal<Arc<LapceConfig>>) -> impl View {
+    dyn_container(
+        move || agent.tasks.get(),
+        move |tasks| {
+            if tasks.is_empty() {
+                return empty().into_any();
+            }
+
+            let total = tasks.len();
+            let completed = tasks
+                .iter()
+                .filter(|task| task.status == "completed")
+                .count();
+            let title = format!("Tasks ({completed}/{total})");
+
+            stack((
+                label(move || title.clone()).style(move |s| {
+                    let config = config.get();
+                    s.width_full()
+                        .font_size(config.ui.font_size() as f32 - 1.0)
+                        .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                        .selectable(false)
+                }),
+                scroll(
+                    stack_from_iter(
+                        tasks.into_iter().map(|task| task_row(task, config)),
+                    )
+                    .style(|s| s.flex_col().width_full().gap(3.0)),
+                )
+                .scroll_style(|s| s.hide_bars(true))
+                .style(|s| s.width_full().max_height(140.0)),
+            ))
+            .style(move |s| {
+                let config = config.get();
+                s.width_full()
+                    .flex_col()
+                    .gap(4.0)
+                    .padding_horiz(10.0)
+                    .padding_vert(6.0)
+                    .border_bottom(1.0)
+                    .border_color(config.color(LapceColor::LAPCE_BORDER))
+                    .background(config.color(LapceColor::PANEL_BACKGROUND))
+            })
+            .into_any()
+        },
+    )
+}
+
+fn task_row(task: AgentTask, config: ReadSignal<Arc<LapceConfig>>) -> AnyView {
+    let (icon, color) = match task.status.as_str() {
+        "completed" => ("✓", LapceColor::EDITOR_DIM),
+        "in_progress" => ("→", LapceColor::LAPCE_WARN),
+        _ => ("○", LapceColor::EDITOR_DIM),
+    };
+    let completed = task.status == "completed";
+
+    h_stack((
+        label(move || icon)
+            .style(move |s| s.color(config.get().color(color)).selectable(false)),
+        label(move || task.content.clone()).style(move |s| {
+            let config = config.get();
+            s.flex_grow(1.0f32)
+                .min_width(0.0)
+                .text_ellipsis()
+                .font_size(config.ui.font_size() as f32 - 1.0)
+                .color(if completed {
+                    config.color(LapceColor::EDITOR_DIM)
+                } else {
+                    config.color(LapceColor::EDITOR_FOREGROUND)
+                })
+                .selectable(false)
+        }),
+    ))
+    .style(|s| s.width_full().items_center().gap(6.0))
+    .into_any()
+}
+
+fn question_view(
+    agent: AgentData,
+    config: ReadSignal<Arc<LapceConfig>>,
+    focus: RwSignal<Focus>,
+) -> impl View {
+    dyn_container(
+        move || (agent.question.get(), agent.question_values.get()),
+        move |(question, values)| {
+            let Some(question) = question else {
+                return empty().into_any();
+            };
+
+            let submit_agent = agent.clone();
+            let decline_agent = agent.clone();
+            let cancel_agent = agent.clone();
+            let fields: Vec<AnyView> = question
+                .fields
+                .iter()
+                .map(|field| {
+                    question_field(field, &values, agent.clone(), config, focus)
+                })
+                .collect();
+
+            stack((
+                label(|| "User input required".to_string()).style(move |s| {
+                    let config = config.get();
+                    s.width_full()
+                        .font_size(config.ui.font_size() as f32 - 1.0)
+                        .color(config.color(LapceColor::LAPCE_WARN))
+                        .selectable(false)
+                }),
+                markdown_text(question.message, config),
+                scroll(
+                    stack_from_iter(fields)
+                        .style(|s| s.flex_col().width_full().gap(8.0)),
+                )
+                .scroll_style(|s| s.hide_bars(true))
+                .style(|s| s.width_full().max_height(220.0)),
+                h_stack((
+                    action_button(
+                        "Submit".to_string(),
+                        move || submit_agent.submit_question_answer(),
+                        config,
+                        true,
+                    ),
+                    action_button(
+                        "Decline".to_string(),
+                        move || {
+                            decline_agent
+                                .answer_question(AgentQuestionAnswer::Decline)
+                        },
+                        config,
+                        false,
+                    ),
+                    action_button(
+                        "Cancel".to_string(),
+                        move || {
+                            cancel_agent.answer_question(AgentQuestionAnswer::Cancel)
+                        },
+                        config,
+                        false,
+                    ),
+                ))
+                .style(|s| s.gap(6.0)),
+            ))
+            .style(move |s| {
+                let config = config.get();
+                s.width_full()
+                    .flex_col()
+                    .gap(6.0)
+                    .padding(10.0)
+                    .border_top(1.0)
+                    .border_color(config.color(LapceColor::LAPCE_BORDER))
+                    .background(config.color(LapceColor::PANEL_BACKGROUND))
+            })
+            .into_any()
+        },
+    )
+}
+
+fn question_field(
+    field: &AgentQuestionField,
+    values: &im::HashMap<String, AgentQuestionValue>,
+    agent: AgentData,
+    config: ReadSignal<Arc<LapceConfig>>,
+    focus: RwSignal<Focus>,
+) -> AnyView {
+    let name = field.name.clone();
+    let title = if field.required {
+        format!("{} *", field.title)
+    } else {
+        field.title.clone()
+    };
+
+    let control: AnyView = match &field.kind {
+        AgentQuestionKind::Text { .. }
+        | AgentQuestionKind::Integer { .. }
+        | AgentQuestionKind::Number { .. } => {
+            let Some(editor) = agent.question_input(&field.name) else {
+                return empty().into_any();
+            };
+            let placeholder = match &field.kind {
+                AgentQuestionKind::Integer { .. } => "Integer",
+                AgentQuestionKind::Number { .. } => "Number",
+                _ => "Type an answer",
+            };
+            let input = TextInputBuilder::new()
+                .is_focused(move || focus.get() == Focus::Panel(PanelKind::Agent))
+                .build_editor(editor)
+                .placeholder(move || placeholder.to_string())
+                .keyboard_navigable();
+            let input_id = input.id();
+            container(input.on_event_cont(EventListener::PointerDown, move |_| {
+                focus.set(Focus::Panel(PanelKind::Agent));
+                input_id.request_focus();
+            }))
+            .style(move |s| {
+                let config = config.get();
+                s.width_full()
+                    .min_width(0.0)
+                    .border(1.0)
+                    .border_radius(4.0)
+                    .border_color(config.color(LapceColor::LAPCE_BORDER))
+                    .background(config.color(LapceColor::EDITOR_BACKGROUND))
+            })
+            .into_any()
+        }
+        AgentQuestionKind::Boolean { .. } => {
+            let current = matches!(
+                values.get(&field.name),
+                Some(AgentQuestionValue::Boolean(true))
+            );
+            let name = name.clone();
+            let toggle_agent = agent.clone();
+            action_button(
+                if current { "On" } else { "Off" }.to_string(),
+                move || toggle_agent.toggle_question_bool(&name),
+                config,
+                current,
+            )
+            .into_any()
+        }
+        AgentQuestionKind::Select { options, .. } => {
+            let items: im::Vector<QuestionChoice> = options
+                .iter()
+                .map(|option| QuestionChoice {
+                    value: option.value.clone(),
+                    title: option.title.clone(),
+                })
+                .collect();
+            if items.is_empty() {
+                return empty().into_any();
+            }
+            let current_value = match values.get(&field.name) {
+                Some(AgentQuestionValue::Select(value)) => value.clone(),
+                _ => items
+                    .get(0)
+                    .map(|item| item.value.clone())
+                    .unwrap_or_default(),
+            };
+            let current = items
+                .iter()
+                .find(|choice| choice.value == current_value)
+                .cloned()
+                .or_else(|| items.get(0).cloned())
+                .unwrap();
+            let name = name.clone();
+            let select_agent = agent.clone();
+            selector(
+                current,
+                items,
+                move |choice| select_agent.set_question_select(&name, choice.value),
+                config,
+            )
+            .into_any()
+        }
+        AgentQuestionKind::MultiSelect { options, .. } => {
+            let buttons: Vec<AnyView> = options
+                .iter()
+                .map(|option| {
+                    let selected = matches!(
+                        values.get(&field.name),
+                        Some(AgentQuestionValue::Multi(values))
+                            if values.contains(&option.value)
+                    );
+                    let name = name.clone();
+                    let value = option.value.clone();
+                    let toggle_agent = agent.clone();
+                    action_button(
+                        option.title.clone(),
+                        move || {
+                            toggle_agent.toggle_question_multi(&name, value.clone())
+                        },
+                        config,
+                        selected,
+                    )
+                    .into_any()
+                })
+                .collect();
+            stack_from_iter(buttons)
+                .style(|s| s.flex_col().width_full().gap(3.0))
+                .into_any()
+        }
+    };
+
+    stack((
+        label(move || title.clone()).style(move |s| {
+            let config = config.get();
+            s.width_full()
+                .min_width(0.0)
+                .text_ellipsis()
+                .font_size(config.ui.font_size() as f32 - 1.0)
+                .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                .selectable(false)
+        }),
+        field
+            .description
+            .clone()
+            .map(|description| {
+                label(move || description.clone())
+                    .style(move |s| {
+                        let config = config.get();
+                        s.width_full()
+                            .font_size(config.ui.font_size() as f32 - 1.0)
+                            .color(config.color(LapceColor::EDITOR_DIM))
+                            .selectable(false)
+                    })
+                    .into_any()
+            })
+            .unwrap_or_else(|| empty().into_any()),
+        control,
+    ))
+    .style(|s| s.width_full().flex_col().gap(3.0))
+    .into_any()
 }
 
 fn config_bar(
@@ -912,7 +1247,7 @@ fn permission_card(
     let cancel_agent = agent.clone();
 
     stack((
-        label(|| "Permission required".to_string()).style(move |s| {
+        label(|| "Tool approval required".to_string()).style(move |s| {
             let config = config.get();
             s.font_size(config.ui.font_size() as f32 - 1.0)
                 .color(config.color(LapceColor::LAPCE_WARN))
