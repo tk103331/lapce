@@ -13,9 +13,10 @@ use floem::{
     style::CursorStyle,
     text::{Attrs, AttrsList, FamilyOwned, TextLayout},
     views::{
-        Decorators, VirtualVector, container, dyn_stack, empty, label,
+        Decorators, VirtualVector, container, dyn_container, dyn_stack, empty,
+        h_stack, label,
         scroll::{PropagatePointerWheel, scroll},
-        stack, svg, text, virtual_stack,
+        stack, stack_from_iter, svg, text, virtual_stack,
     },
 };
 use indexmap::IndexMap;
@@ -29,9 +30,14 @@ use serde_json::Value;
 use crate::{
     command::CommandExecuted,
     config::{
-        DropdownInfo, LapceConfig, agent::AgentConfig, color::LapceColor,
-        core::CoreConfig, editor::EditorConfig, icon::LapceIcons,
-        terminal::TerminalConfig, ui::UIConfig,
+        DropdownInfo, LapceConfig,
+        agent::{AgentConfig, AgentProfile},
+        color::LapceColor,
+        core::CoreConfig,
+        editor::EditorConfig,
+        icon::LapceIcons,
+        terminal::TerminalConfig,
+        ui::UIConfig,
     },
     keypress::KeyPressFocus,
     main_split::Editors,
@@ -338,6 +344,7 @@ pub fn settings_view(
     let cx = Scope::current();
     let settings_data = SettingsData::new(cx, installed_plugins, common.clone());
     let view_settings_data = settings_data.clone();
+    let section_settings_data = settings_data.clone();
     let plugin_kinds = settings_data.plugin_kinds;
 
     let search_editor = editors.make_local(cx, common);
@@ -510,26 +517,35 @@ pub fn settings_view(
             .style(|s| s.padding_horiz(50.0).padding_vert(20.0)),
             container({
                 scroll({
-                    dyn_stack(
-                        move || filtered_items_signal.get(),
-                        |item| {
-                            (
-                                item.kind.clone(),
-                                item.name.clone(),
-                                item.serde_value.clone(),
-                            )
-                        },
-                        move |item| {
-                            settings_item_view(
-                                editors,
-                                view_settings_data.clone(),
-                                item,
-                            )
-                        },
-                    )
+                    stack((
+                        dyn_stack(
+                            move || filtered_items_signal.get(),
+                            |item| {
+                                (
+                                    item.kind.clone(),
+                                    item.name.clone(),
+                                    item.serde_value.clone(),
+                                )
+                            },
+                            move |item| {
+                                settings_item_view(
+                                    editors,
+                                    view_settings_data.clone(),
+                                    item,
+                                )
+                            },
+                        )
+                        .style(|s| s.flex_col()),
+                        agent_profiles_section(
+                            editors,
+                            section_settings_data.common.clone(),
+                            config,
+                        ),
+                    ))
                     .style(|s| {
                         s.flex_col()
                             .padding_horiz(50.0)
+                            .padding_bottom(40.0)
                             .min_width_pct(100.0)
                             .max_width(400.0)
                     })
@@ -551,6 +567,275 @@ pub fn settings_view(
     .debug_name("Settings")
     .on_cleanup(move || {
         editors.remove(search_editor_id);
+    })
+}
+
+fn settings_action_button(
+    text: &'static str,
+    action: impl Fn() + 'static,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    container(label(move || text.to_string()))
+        .on_click_stop(move |_| action())
+        .style(move |s| {
+            let config = config.get();
+            s.padding_horiz(8.0)
+                .padding_vert(3.0)
+                .border(1.0)
+                .border_radius(4.0)
+                .border_color(config.color(LapceColor::LAPCE_BORDER))
+                .font_size(config.ui.font_size() as f32 - 1.0)
+                .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                .cursor(CursorStyle::Pointer)
+                .selectable(false)
+                .hover(|s| {
+                    s.background(config.color(LapceColor::PANEL_HOVERED_BACKGROUND))
+                })
+        })
+}
+
+fn agent_profiles_section(
+    editors: Editors,
+    common: Rc<CommonData>,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let editing = create_rw_signal(false);
+    let original = create_rw_signal(String::new());
+
+    let rows_common = common.clone();
+    let rows = dyn_container(
+        move || config.get().agent.profiles(),
+        move |profiles| {
+            let common = rows_common.clone();
+            stack_from_iter(profiles.into_iter().map(move |profile| {
+                let name = profile.name.clone();
+                let command = profile.command.clone();
+                let row_name = name.clone();
+                let row_common = common.clone();
+                let delete_common = common.clone();
+                let delete_name = name.clone();
+                let delete_active = name.clone();
+
+                h_stack((
+                    stack((
+                        label(move || row_name.clone()).style(move |s| {
+                            let config = config.get();
+                            s.width_full()
+                                .text_ellipsis()
+                                .font_size(config.ui.font_size() as f32)
+                                .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                                .selectable(false)
+                        }),
+                        label(move || command.clone()).style(move |s| {
+                            let config = config.get();
+                            s.width_full()
+                                .text_ellipsis()
+                                .font_size(config.ui.font_size() as f32 - 1.0)
+                                .color(config.color(LapceColor::EDITOR_DIM))
+                                .selectable(false)
+                        }),
+                    ))
+                    .style(|s| s.flex_col().flex_grow(1.0f32).min_width(0.0)),
+                    settings_action_button(
+                        "Edit",
+                        move || {
+                            let _ = &row_common;
+                            original.set(name.clone());
+                            editing.set(true);
+                        },
+                        config,
+                    ),
+                    settings_action_button(
+                        "Delete",
+                        move || {
+                            let agent =
+                                delete_common.config.get_untracked().agent.clone();
+                            let active = agent.active_profile().name;
+                            let profiles: Vec<AgentProfile> = agent
+                                .profiles()
+                                .into_iter()
+                                .filter(|profile| profile.name != delete_name)
+                                .collect();
+                            let active = if active == delete_active {
+                                profiles
+                                    .first()
+                                    .map(|profile| profile.name.clone())
+                                    .unwrap_or_default()
+                            } else {
+                                active
+                            };
+                            LapceConfig::update_agent_profiles(&profiles, &active);
+                        },
+                        config,
+                    ),
+                ))
+                .style(|s| s.width_full().items_center().gap(8.0).padding_vert(4.0))
+            }))
+            .style(|s| s.flex_col().width_full())
+        },
+    );
+
+    let add = settings_action_button(
+        "Add agent",
+        move || {
+            original.set(String::new());
+            editing.set(true);
+        },
+        config,
+    );
+
+    let form_common = common.clone();
+    let form_editing = editing;
+    let form = dyn_container(
+        move || (form_editing.get(), original.get()),
+        move |(editing, original)| {
+            if !editing {
+                return empty().into_any();
+            }
+
+            agent_profile_form(
+                editors,
+                form_common.clone(),
+                config,
+                original,
+                form_editing,
+            )
+            .into_any()
+        },
+    );
+
+    stack((
+        label(|| "Agent: Profiles".to_string()).style(move |s| {
+            let config = config.get();
+            s.width_full()
+                .line_height(2.0)
+                .font_bold()
+                .font_size(config.ui.font_size() as f32 + 2.0)
+                .padding_horiz(10.0)
+                .background(config.color(LapceColor::PANEL_BACKGROUND))
+        }),
+        label(|| {
+            "ACP agents available in the Agent panel. The + button in the \
+             panel header starts a new session with the selected agent."
+                .to_string()
+        })
+        .style(move |s| {
+            let config = config.get();
+            s.width_full()
+                .font_size(config.ui.font_size() as f32 - 1.0)
+                .color(config.color(LapceColor::EDITOR_DIM))
+                .selectable(false)
+        }),
+        rows,
+        container(add).style(|s| s.padding_vert(6.0)),
+        form,
+    ))
+    .style(|s| s.width_full().flex_col().gap(6.0).padding_top(20.0))
+}
+
+fn agent_profile_form(
+    editors: Editors,
+    common: Rc<CommonData>,
+    config: ReadSignal<Arc<LapceConfig>>,
+    original: String,
+    editing: RwSignal<bool>,
+) -> impl View {
+    let cx = Scope::current();
+    let agent_config = common.config.get_untracked().agent.clone();
+    let existing = agent_config
+        .profiles()
+        .into_iter()
+        .find(|profile| profile.name == original);
+
+    let name_input = TextInputBuilder::new()
+        .value(
+            existing
+                .as_ref()
+                .map(|profile| profile.name.clone())
+                .unwrap_or_default(),
+        )
+        .build(cx, editors, common.clone());
+    let name_editor = name_input.editor();
+    let command_input = TextInputBuilder::new()
+        .value(
+            existing
+                .as_ref()
+                .map(|profile| profile.command.clone())
+                .unwrap_or_default(),
+        )
+        .build(cx, editors, common.clone());
+    let command_editor = command_input.editor();
+
+    let cancel_editing = editing;
+    let save_common = common.clone();
+    let save_original = original;
+
+    stack((
+        name_input
+            .style(move |s| s.width_full().border_radius(5.0))
+            .keyboard_navigable(),
+        command_input
+            .style(move |s| s.width_full().border_radius(5.0))
+            .keyboard_navigable(),
+        h_stack((
+            settings_action_button(
+                "Save",
+                move || {
+                    let name = name_editor
+                        .doc()
+                        .buffer
+                        .with(|buffer| buffer.to_string())
+                        .trim()
+                        .to_string();
+                    let command = command_editor
+                        .doc()
+                        .buffer
+                        .with(|buffer| buffer.to_string())
+                        .trim()
+                        .to_string();
+                    if name.is_empty() || command.is_empty() {
+                        return;
+                    }
+
+                    let agent = save_common.config.get_untracked().agent.clone();
+                    let active = agent.active_profile().name;
+                    let mut profiles: Vec<AgentProfile> = agent
+                        .profiles()
+                        .into_iter()
+                        .filter(|profile| profile.name != save_original)
+                        .collect();
+                    profiles.push(AgentProfile {
+                        name: name.clone(),
+                        command,
+                    });
+                    let active = if active == save_original || active.is_empty() {
+                        name
+                    } else {
+                        active
+                    };
+                    LapceConfig::update_agent_profiles(&profiles, &active);
+                    editing.set(false);
+                },
+                config,
+            ),
+            settings_action_button(
+                "Cancel",
+                move || cancel_editing.set(false),
+                config,
+            ),
+        ))
+        .style(|s| s.gap(6.0)),
+    ))
+    .style(move |s| {
+        let config = config.get();
+        s.width_full()
+            .flex_col()
+            .gap(6.0)
+            .padding(8.0)
+            .border(1.0)
+            .border_radius(6.0)
+            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .background(config.color(LapceColor::PANEL_BACKGROUND))
     })
 }
 

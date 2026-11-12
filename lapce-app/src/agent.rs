@@ -23,17 +23,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
 use floem::{
     ext_event::create_signal_from_channel,
+    keyboard::Modifiers,
     reactive::{ReadSignal, RwSignal, Scope, SignalGet, SignalUpdate, SignalWith},
 };
+use lapce_core::{command::EditCommand, mode::Mode};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
 use crate::{
+    command::{CommandExecuted, CommandKind, LapceCommand},
     config::{
         LapceConfig,
         agent::{AgentConfig, AgentProfile},
     },
     editor::EditorData,
+    keypress::{KeyPressFocus, condition::Condition},
     main_split::Editors,
     window_tab::CommonData,
 };
@@ -196,6 +200,17 @@ pub enum AgentQuestionAnswer {
     Cancel,
 }
 
+/// Summary of a conversation shown in the session history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSessionInfo {
+    pub id: u64,
+    pub agent: String,
+    pub title: String,
+    pub messages: usize,
+    pub created: u64,
+    pub active: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentTask {
     pub content: String,
@@ -274,6 +289,7 @@ enum AgentCommand {
     Prompt(String),
     Cancel,
     NewSession,
+    UseSession(Option<String>),
     Shutdown,
     SetModel(String),
     SetMode(String),
@@ -318,6 +334,48 @@ struct Store {
     next_question_id: u64,
     usage: Option<AgentUsage>,
     context_usage: Option<AgentContextUsage>,
+    sessions: Vec<SessionArchive>,
+    current_session: u64,
+    next_session_id: u64,
+    session_created: u64,
+    acp_session_id: Option<String>,
+}
+
+#[derive(Clone)]
+struct SessionArchive {
+    id: u64,
+    agent: String,
+    title: String,
+    created: u64,
+    acp_session_id: Option<String>,
+    messages: Vec<AgentMessage>,
+    usage: Option<AgentUsage>,
+    context_usage: Option<AgentContextUsage>,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn message_preview(text: &str) -> String {
+    let first = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut chars = first.chars();
+    let mut preview: String = chars.by_ref().take(80).collect();
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    if preview.is_empty() {
+        "New session".to_string()
+    } else {
+        preview
+    }
 }
 
 impl Store {
@@ -374,6 +432,136 @@ impl Store {
         self.question_tx = None;
         self.tasks.clear();
         self.status = AgentStatus::Thinking;
+    }
+
+    fn archive_current(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+
+        let title = self
+            .messages
+            .iter()
+            .find(|message| message.role == AgentRole::User)
+            .map(|message| message_preview(&message.content))
+            .unwrap_or_else(|| "New session".to_string());
+        let archive = SessionArchive {
+            id: self.current_session,
+            agent: self.agent_name.clone().unwrap_or_default(),
+            title,
+            created: self.session_created,
+            acp_session_id: self.acp_session_id.clone(),
+            messages: self.messages.clone(),
+            usage: self.usage.clone(),
+            context_usage: self.context_usage.clone(),
+        };
+
+        if let Some(existing) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == archive.id)
+        {
+            *existing = archive;
+        } else {
+            self.sessions.push(archive);
+        }
+    }
+
+    fn begin_session(&mut self) {
+        self.archive_current();
+        if self.next_session_id < self.current_session {
+            self.next_session_id = self.current_session;
+        }
+        self.next_session_id += 1;
+        self.current_session = self.next_session_id;
+        self.session_created = now_secs();
+        self.reset_transcript();
+        self.status = AgentStatus::Starting;
+    }
+
+    fn reset_transcript(&mut self) {
+        self.messages.clear();
+        self.tool_messages.clear();
+        self.assistant_message = None;
+        self.thought_message = None;
+        self.permission = None;
+        self.permission_tx = None;
+        self.question = None;
+        self.question_tx = None;
+        self.tasks.clear();
+        self.usage = None;
+        self.context_usage = None;
+        self.acp_session_id = None;
+    }
+
+    fn session_agent(&self, id: u64) -> Option<String> {
+        if id == self.current_session {
+            return Some(self.agent_name.clone().unwrap_or_default());
+        }
+        self.sessions
+            .iter()
+            .find(|session| session.id == id)
+            .map(|session| session.agent.clone())
+    }
+
+    fn load_session(&mut self, id: u64) -> Option<Option<String>> {
+        if id == self.current_session {
+            return Some(self.acp_session_id.clone());
+        }
+
+        self.archive_current();
+        let index = self.sessions.iter().position(|session| session.id == id)?;
+        let archive = self.sessions.remove(index);
+        self.current_session = archive.id;
+        self.session_created = archive.created;
+        self.messages = archive.messages;
+        self.usage = archive.usage;
+        self.context_usage = archive.context_usage;
+        self.acp_session_id = archive.acp_session_id.clone();
+        self.tool_messages.clear();
+        self.assistant_message = None;
+        self.thought_message = None;
+        self.permission = None;
+        self.permission_tx = None;
+        self.question = None;
+        self.question_tx = None;
+        self.tasks.clear();
+        self.status = AgentStatus::Ready;
+        Some(archive.acp_session_id)
+    }
+
+    fn session_infos(&self) -> Vec<AgentSessionInfo> {
+        let mut infos = Vec::new();
+        if !self.messages.is_empty() {
+            let title = self
+                .messages
+                .iter()
+                .find(|message| message.role == AgentRole::User)
+                .map(|message| message_preview(&message.content))
+                .unwrap_or_else(|| "New session".to_string());
+            infos.push(AgentSessionInfo {
+                id: self.current_session,
+                agent: self.agent_name.clone().unwrap_or_default(),
+                title,
+                messages: self.messages.len(),
+                created: self.session_created,
+                active: true,
+            });
+        }
+
+        for session in self.sessions.iter() {
+            infos.push(AgentSessionInfo {
+                id: session.id,
+                agent: session.agent.clone(),
+                title: session.title.clone(),
+                messages: session.messages.len(),
+                created: session.created,
+                active: session.id == self.current_session,
+            });
+        }
+
+        infos.sort_by(|a, b| b.created.cmp(&a.created).then(b.id.cmp(&a.id)));
+        infos
     }
 
     fn clear(&mut self) {
@@ -520,9 +708,8 @@ pub struct AgentData {
     pub expanded_tools: RwSignal<im::HashSet<u64>>,
     pub profiles: RwSignal<im::Vector<AgentProfile>>,
     pub active_profile: RwSignal<String>,
-    pub show_add_agent: RwSignal<bool>,
-    pub new_agent_name_input: EditorData,
-    pub new_agent_command_input: EditorData,
+    pub sessions: RwSignal<im::Vector<AgentSessionInfo>>,
+    pub sessions_open: RwSignal<bool>,
     store: Arc<Mutex<Store>>,
     notifier: Arc<Notifier>,
     sender: Arc<Mutex<Option<Sender<AgentCommand>>>>,
@@ -533,11 +720,50 @@ pub struct AgentData {
     question_inputs: Rc<RefCell<HashMap<String, EditorData>>>,
 }
 
+impl std::fmt::Debug for AgentData {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("AgentData").finish()
+    }
+}
+
+impl KeyPressFocus for AgentData {
+    fn get_mode(&self) -> Mode {
+        self.input.get_mode()
+    }
+
+    fn check_condition(&self, condition: Condition) -> bool {
+        self.input.check_condition(condition)
+    }
+
+    fn run_command(
+        &self,
+        command: &LapceCommand,
+        count: Option<usize>,
+        mods: Modifiers,
+    ) -> CommandExecuted {
+        if matches!(&command.kind, CommandKind::Edit(EditCommand::InsertNewLine))
+            && !mods.contains(Modifiers::SHIFT)
+            && !mods.contains(Modifiers::ALT)
+        {
+            self.submit_input();
+            return CommandExecuted::Yes;
+        }
+
+        self.input.run_command(command, count, mods)
+    }
+
+    fn expect_char(&self) -> bool {
+        self.input.expect_char()
+    }
+
+    fn receive_char(&self, c: &str) {
+        self.input.receive_char(c);
+    }
+}
+
 impl AgentData {
     pub fn new(cx: Scope, editors: Editors, common: Rc<CommonData>) -> Self {
         let input = editors.make_local(cx, common.clone());
-        let new_agent_name_input = editors.make_local(cx, common.clone());
-        let new_agent_command_input = editors.make_local(cx, common.clone());
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let revision = create_signal_from_channel(receiver);
         let notifier = Arc::new(Notifier {
@@ -572,9 +798,8 @@ impl AgentData {
             expanded_tools: cx.create_rw_signal(im::HashSet::new()),
             profiles: cx.create_rw_signal(profiles),
             active_profile: cx.create_rw_signal(active_profile.name.clone()),
-            show_add_agent: cx.create_rw_signal(false),
-            new_agent_name_input,
-            new_agent_command_input,
+            sessions: cx.create_rw_signal(im::Vector::new()),
+            sessions_open: cx.create_rw_signal(false),
             store,
             notifier,
             sender: Arc::new(Mutex::new(None)),
@@ -589,6 +814,24 @@ impl AgentData {
         cx.create_effect(move |_| {
             if data_for_effect.revision.get().is_some() {
                 data_for_effect.sync();
+            }
+        });
+
+        // Keep the panel in sync with profiles edited in the settings page.
+        let data_for_profiles = data.clone();
+        cx.create_effect(move |_| {
+            let agent_config = data_for_profiles.common.config.get().agent.clone();
+            let profiles: im::Vector<AgentProfile> =
+                agent_config.profiles().into_iter().collect();
+            if data_for_profiles.profiles.get_untracked() != profiles {
+                data_for_profiles.profiles.set(profiles);
+            }
+            let active = agent_config.active_profile();
+            if !active.name.is_empty()
+                && data_for_profiles.active_profile.get_untracked() != active.name
+            {
+                data_for_profiles.active_profile.set(active.name.clone());
+                *data_for_profiles.profile.lock() = Some(active);
             }
         });
 
@@ -608,6 +851,7 @@ impl AgentData {
             question,
             usage,
             context_usage,
+            sessions,
             restart,
         ) = {
             let mut store = self.store.lock();
@@ -632,6 +876,7 @@ impl AgentData {
                 store.question.clone(),
                 store.usage.clone(),
                 store.context_usage.clone(),
+                store.session_infos().into_iter().collect::<im::Vector<_>>(),
                 restart,
             )
         };
@@ -666,6 +911,9 @@ impl AgentData {
         }
         if self.context_usage.get_untracked() != context_usage {
             self.context_usage.set(context_usage);
+        }
+        if self.sessions.get_untracked() != sessions {
+            self.sessions.set(sessions);
         }
 
         self.messages.update(|existing| {
@@ -759,19 +1007,46 @@ impl AgentData {
         }
     }
 
-    /// Start a fresh ACP session, keeping the agent process alive.
+    /// Start a fresh ACP session with the current agent, keeping the
+    /// previous conversation in the history.
     pub fn new_session(&self) {
+        self.start_session(None);
+    }
+
+    /// Start a fresh ACP session with the given agent profile. The profile
+    /// becomes the active agent and its name is shown in the panel header.
+    pub fn new_session_with_profile(&self, name: String) {
+        self.start_session(Some(name));
+    }
+
+    fn start_session(&self, profile_name: Option<String>) {
         if self.status.get_untracked().is_busy() {
             return;
         }
 
+        let mut switched = false;
+        if let Some(name) = profile_name.as_deref() {
+            if self.active_profile.get_untracked() != name {
+                // Keep the current conversation before the restart clears it.
+                self.store.lock().archive_current();
+            }
+            switched = self.apply_profile(name);
+        }
+
         {
             let mut store = self.store.lock();
-            store.clear();
-            store.status = AgentStatus::Starting;
+            store.begin_session();
+            store.agent_name = Some(self.active_profile.get_untracked());
         }
+        self.sessions_open.set(false);
         self.auto_scroll.set(true);
         self.notifier.notify();
+
+        if switched {
+            // `apply_profile` restarts the process; `sync` starts it again
+            // once the old process has exited.
+            return;
+        }
 
         if self.running.load(Ordering::SeqCst) {
             if let Some(sender) = self.sender.lock().as_ref() {
@@ -780,6 +1055,75 @@ impl AgentData {
         } else {
             self.ensure_started();
         }
+    }
+
+    /// Load a conversation from the session history.
+    pub fn switch_session(&self, id: u64) {
+        if self.status.get_untracked().is_busy() {
+            return;
+        }
+
+        let Some(agent) = self.store.lock().session_agent(id) else {
+            return;
+        };
+
+        let same_profile =
+            agent.is_empty() || self.active_profile.get_untracked() == agent;
+        if !same_profile {
+            self.store.lock().archive_current();
+            self.apply_profile(&agent);
+        }
+
+        let resume = {
+            let mut store = self.store.lock();
+            let resume = store.load_session(id);
+            if !same_profile {
+                // A restarted process creates a brand new ACP session.
+                store.acp_session_id = None;
+            }
+            resume
+        };
+        let Some(resume) = resume else {
+            return;
+        };
+        let resume = if same_profile { resume } else { None };
+
+        self.sessions_open.set(false);
+        self.auto_scroll.set(true);
+        self.notifier.notify();
+
+        if self.running.load(Ordering::SeqCst) {
+            if let Some(sender) = self.sender.lock().as_ref() {
+                let _ = sender.send(AgentCommand::UseSession(resume));
+            }
+        }
+    }
+
+    pub fn toggle_sessions(&self) {
+        self.sessions_open.update(|open| *open = !*open);
+    }
+
+    /// Apply an agent profile, restarting the process when it changed.
+    /// Returns whether a restart was requested.
+    fn apply_profile(&self, name: &str) -> bool {
+        if self.active_profile.get_untracked() == name {
+            return false;
+        }
+
+        let profiles = self.profiles.get_untracked();
+        let Some(profile) = profiles
+            .iter()
+            .find(|profile| profile.name == name)
+            .cloned()
+        else {
+            return false;
+        };
+
+        *self.profile.lock() = Some(profile.clone());
+        self.active_profile.set(profile.name);
+        self.persist_agent_profiles();
+        self.restart();
+        true
     }
 
     /// Stop the current process and start a new one with the current config.
@@ -817,74 +1161,6 @@ impl AgentData {
         store.status = AgentStatus::Thinking;
         drop(store);
         self.notifier.notify();
-    }
-
-    pub fn toggle_add_agent(&self) {
-        self.show_add_agent.update(|show| *show = !*show);
-    }
-
-    /// Add the agent described by the inline form and start using it.
-    pub fn submit_new_agent(&self) {
-        let command = self
-            .new_agent_command_input
-            .doc()
-            .buffer
-            .with(|buffer| buffer.to_string());
-        let command = command.trim().to_string();
-        if command.is_empty() {
-            return;
-        }
-
-        let name = self
-            .new_agent_name_input
-            .doc()
-            .buffer
-            .with(|buffer| buffer.to_string());
-        let name = name.trim().to_string();
-        let name = if name.is_empty() {
-            command
-                .split_whitespace()
-                .next()
-                .unwrap_or("Agent")
-                .to_string()
-        } else {
-            name
-        };
-
-        let profile = AgentProfile { name, command };
-        self.profiles
-            .update(|profiles| profiles.push_back(profile.clone()));
-        *self.profile.lock() = Some(profile.clone());
-        self.active_profile.set(profile.name.clone());
-        self.persist_agent_profiles();
-
-        self.new_agent_name_input.reset();
-        self.new_agent_command_input.reset();
-        self.show_add_agent.set(false);
-        self.restart();
-    }
-
-    /// Switch to a configured agent profile and restart the agent process.
-    pub fn select_profile(&self, name: String) {
-        if self.active_profile.get_untracked() == name
-            && self.running.load(Ordering::SeqCst)
-        {
-            return;
-        }
-
-        let profiles = self.profiles.get_untracked();
-        let Some(profile) = profiles
-            .iter()
-            .find(|profile| profile.name == name)
-            .cloned()
-        else {
-            return;
-        };
-
-        *self.profile.lock() = Some(profile.clone());
-        self.active_profile.set(profile.name);
-        self.persist_agent_profiles();
-        self.restart();
     }
 
     fn persist_agent_profiles(&self) {
@@ -1432,7 +1708,11 @@ impl ProtocolConnection {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        self.store.lock().agent_name = agent_name;
+        let mut store = self.store.lock();
+        if store.agent_name.as_deref().unwrap_or("").is_empty() {
+            store.agent_name = agent_name;
+        }
+        drop(store);
         self.notifier.notify();
         Ok(true)
     }
@@ -1456,9 +1736,10 @@ impl ProtocolConnection {
             .ok_or_else(|| anyhow!("Agent did not return a session id"))?
             .to_string();
 
-        self.session_id = Some(session_id);
+        self.session_id = Some(session_id.clone());
         {
             let mut store = self.store.lock();
+            store.acp_session_id = Some(session_id);
             store.models = parse_models(&result["models"]);
             store.modes = parse_modes(&result["modes"]);
             store.config_options = parse_config_options(&result["configOptions"]);
@@ -1484,6 +1765,9 @@ impl ProtocolConnection {
                     if !self.new_session(commands)? {
                         return Ok(());
                     }
+                }
+                Some(AgentCommand::UseSession(session_id)) => {
+                    self.session_id = session_id;
                 }
                 Some(AgentCommand::SetModel(model_id)) => {
                     self.send_set_model(&model_id)?;
@@ -1897,6 +2181,7 @@ impl ProtocolConnection {
                             }
                             Ok(AgentCommand::Cancel) => Some(Ok(None)),
                             Ok(AgentCommand::NewSession)
+                            | Ok(AgentCommand::UseSession(_))
                             | Ok(AgentCommand::Prompt(_))
                             | Ok(AgentCommand::SetModel(_))
                             | Ok(AgentCommand::SetMode(_))
@@ -1987,6 +2272,7 @@ impl ProtocolConnection {
                             | Ok(AgentCommand::SetMode(_))
                             | Ok(AgentCommand::SetConfigOption { .. })
                             | Ok(AgentCommand::NewSession)
+                            | Ok(AgentCommand::UseSession(_))
                             | Ok(AgentCommand::Prompt(_)) => None,
                         }
                     }

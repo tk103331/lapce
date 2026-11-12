@@ -2409,6 +2409,9 @@ impl WindowTabData {
             Focus::Panel(PanelKind::SourceControl) => {
                 Some(keypress.key_down(event, &self.source_control))
             }
+            Focus::Panel(PanelKind::Agent) => {
+                Some(keypress.key_down(event, &self.agent))
+            }
             _ => None,
         };
 

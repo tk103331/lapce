@@ -11,6 +11,9 @@
 - Agent Chat supports multiple ACP agent profiles and model/mode/config option selection
 - Agent Chat handles tool approvals, ACP elicitation questions and task lists
 - Agent Chat messages can be copied, thinking/tool output can be collapsed, and token usage is shown
+- Agent profiles are configured in Settings and picked from the new session menu
+- The Agent panel keeps a session history that can be reopened
+- Agent composer accepts typing and submits on Enter
 
 ### Bug Fixes
 
