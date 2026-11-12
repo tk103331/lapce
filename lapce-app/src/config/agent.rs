@@ -33,6 +33,9 @@ pub struct AgentProfile {
     pub name: String,
     /// Command used to start the agent, including any arguments.
     pub command: String,
+    /// Extra environment variables passed to the agent, as `KEY=VALUE`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
 }
 
 impl AgentConfig {
@@ -46,6 +49,7 @@ impl AgentConfig {
             vec![AgentProfile {
                 name,
                 command: self.command.clone(),
+                env: Vec::new(),
             }]
         } else {
             self.agents.clone()
@@ -65,19 +69,38 @@ impl AgentConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        let claude = AgentProfile {
-            name: "Claude Code".to_string(),
-            command: "npx -y @zed-industries/claude-code-acp".to_string(),
-        };
-        let gemini = AgentProfile {
-            name: "Gemini CLI".to_string(),
-            command: "gemini --experimental-acp".to_string(),
-        };
+        let agents = vec![
+            AgentProfile {
+                name: "Claude Code".to_string(),
+                command: "npx -y @zed-industries/claude-code-acp".to_string(),
+                env: Vec::new(),
+            },
+            AgentProfile {
+                name: "Codex CLI".to_string(),
+                command: "npx -y @zed-industries/codex-acp".to_string(),
+                env: Vec::new(),
+            },
+            AgentProfile {
+                name: "OpenCode".to_string(),
+                command: "opencode acp".to_string(),
+                env: Vec::new(),
+            },
+            AgentProfile {
+                name: "Pi Agent".to_string(),
+                command: "npx -y pi-acp".to_string(),
+                env: Vec::new(),
+            },
+            AgentProfile {
+                name: "Gemini CLI".to_string(),
+                command: "gemini --experimental-acp".to_string(),
+                env: Vec::new(),
+            },
+        ];
         Self {
-            command: claude.command.clone(),
+            command: agents[0].command.clone(),
             auto_approve: false,
-            active: claude.name.clone(),
-            agents: vec![claude, gemini],
+            active: agents[0].name.clone(),
+            agents,
         }
     }
 }

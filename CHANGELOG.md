@@ -14,6 +14,7 @@
 - Agent profiles are configured in Settings and picked from the new session menu
 - The Agent panel keeps a session history that can be reopened
 - Agent composer accepts typing and submits on Enter
+- Agent profiles live with the Agent settings and support environment variables
 
 ### Bug Fixes
 

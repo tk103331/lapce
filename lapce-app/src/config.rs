@@ -1007,6 +1007,13 @@ impl LapceConfig {
             let mut table = toml_edit::Table::new();
             table.insert("name", toml_edit::value(profile.name.clone()));
             table.insert("command", toml_edit::value(profile.command.clone()));
+            if !profile.env.is_empty() {
+                let mut env = toml_edit::Array::new();
+                for entry in &profile.env {
+                    env.push(entry.clone());
+                }
+                table.insert("env", toml_edit::value(env));
+            }
             agents.push(table);
         }
         agent.insert("agents", toml_edit::Item::ArrayOfTables(agents));

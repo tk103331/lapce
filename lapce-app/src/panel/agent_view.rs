@@ -1,22 +1,21 @@
 use std::{rc::Rc, sync::Arc};
 
-use floem::views::{
-    dropdown::Dropdown,
-    editor::{core::register::Clipboard, text::SystemClipboard},
-};
+use floem::views::editor::{core::register::Clipboard, text::SystemClipboard};
 use floem::{
     AnyView, IntoView, View,
+    action::{add_overlay, remove_overlay},
     event::EventListener,
     keyboard::Modifiers,
-    kurbo::Point,
+    kurbo::{Point, Size},
     reactive::{
-        ReadSignal, RwSignal, SignalGet, SignalUpdate, create_memo, create_rw_signal,
+        ReadSignal, RwSignal, SignalGet, SignalUpdate, create_effect, create_memo,
+        create_rw_signal,
     },
     style::CursorStyle,
     views::{
         Decorators, container, dyn_container, dyn_stack, empty, h_stack, label,
         rich_text,
-        scroll::{ScrollClass, scroll},
+        scroll::{PropagatePointerWheel, scroll},
         stack, stack_from_iter,
     },
 };
@@ -40,152 +39,216 @@ use crate::{
     window_tab::{Focus, WindowTabData},
 };
 
-trait SelectorItem: Clone + std::fmt::Display + 'static {
-    fn selector_label(&self) -> String;
-}
-
-#[derive(Clone)]
-struct ProfileChoice {
-    name: String,
-}
-
-impl std::fmt::Display for ProfileChoice {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} ▾", self.name)
-    }
-}
-
-impl SelectorItem for ProfileChoice {
-    fn selector_label(&self) -> String {
-        self.name.clone()
-    }
-}
-
-#[derive(Clone)]
-struct ModelChoice {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectOption {
     id: String,
-    name: String,
+    label: String,
 }
 
-impl std::fmt::Display for ModelChoice {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} ▾", self.name)
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectChrome {
+    Bordered,
+    Plain,
 }
 
-impl SelectorItem for ModelChoice {
-    fn selector_label(&self) -> String {
-        self.name.clone()
-    }
-}
-
-#[derive(Clone)]
-struct ConfigValueChoice {
-    value: String,
-    name: String,
-}
-
-impl std::fmt::Display for ConfigValueChoice {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} ▾", self.name)
-    }
-}
-
-impl SelectorItem for ConfigValueChoice {
-    fn selector_label(&self) -> String {
-        self.name.clone()
-    }
-}
-
-#[derive(Clone)]
-struct QuestionChoice {
-    value: String,
-    title: String,
-}
-
-impl std::fmt::Display for QuestionChoice {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{} ▾", self.title)
-    }
-}
-
-impl SelectorItem for QuestionChoice {
-    fn selector_label(&self) -> String {
-        self.title.clone()
-    }
-}
-
-fn selector<T: SelectorItem>(
-    current: T,
-    items: im::Vector<T>,
-    on_accept: impl Fn(T) + 'static,
+/// A compact select control. The list of options is rendered as an overlay
+/// and opens upwards when there is not enough room below the control.
+fn select_control(
+    current_label: impl Fn() -> String + 'static,
+    items: im::Vector<SelectOption>,
+    on_accept: impl Fn(String) + 'static,
+    window_size: RwSignal<Size>,
     config: ReadSignal<Arc<LapceConfig>>,
-) -> Dropdown<T> {
-    let current = current.clone();
-    Dropdown::new(move || current.clone(), items)
-        .on_accept(on_accept)
-        .main_view(move |item| {
-            let text = item.to_string();
-            label(move || text.clone())
-                .style(move |s| {
-                    let config = config.get();
-                    s.max_width(180.0)
-                        .min_width(0.0)
-                        .text_ellipsis()
-                        .font_size(config.ui.font_size() as f32 - 1.0)
-                        .color(config.color(LapceColor::EDITOR_FOREGROUND))
-                        .selectable(false)
-                })
-                .into_any()
-        })
-        .list_item_view(move |item| {
-            let text = item.selector_label();
-            label(move || text.clone())
-                .style(move |s| {
-                    let config = config.get();
-                    s.width_full()
-                        .padding_horiz(10.0)
-                        .padding_vert(5.0)
-                        .font_size(config.ui.font_size() as f32 - 1.0)
-                        .color(config.color(LapceColor::EDITOR_FOREGROUND))
-                        .selectable(false)
-                        .hover(|s| {
-                            s.background(
-                                config.color(LapceColor::PANEL_HOVERED_BACKGROUND),
-                            )
-                        })
-                })
-                .into_any()
-        })
-        .style(move |s| {
-            let lapce_config = config.get();
-            s.padding_horiz(7.0)
-                .padding_vert(3.0)
-                .min_width(0.0)
-                .max_width_pct(100.0)
-                .border(1.0)
-                .border_radius(5.0)
-                .border_color(lapce_config.color(LapceColor::LAPCE_BORDER))
-                .background(lapce_config.color(LapceColor::EDITOR_BACKGROUND))
-                .font_size(lapce_config.ui.font_size() as f32 - 1.0)
-                .color(lapce_config.color(LapceColor::EDITOR_FOREGROUND))
-                .cursor(CursorStyle::Pointer)
-                .hover(|s| {
-                    s.background(
-                        lapce_config.color(LapceColor::PANEL_HOVERED_BACKGROUND),
+    chrome: SelectChrome,
+    max_width: f32,
+) -> impl View {
+    let expanded = create_rw_signal(false);
+    let window_origin = create_rw_signal(Point::ZERO);
+    let control_size = create_rw_signal(Size::ZERO);
+    let overlay_id = create_rw_signal(None);
+    let list_size = create_rw_signal(Size::ZERO);
+    let list_focus = create_rw_signal(false);
+    let control_focus = create_rw_signal(false);
+
+    let handler: Rc<dyn Fn(String)> = Rc::new(on_accept);
+    let overlay_items = items.clone();
+    let overlay_config = config;
+    create_effect(move |_| {
+        if expanded.get() {
+            let items = overlay_items.clone();
+            let handler = handler.clone();
+            let id =
+                add_overlay(Point::ZERO, move |_| {
+                    let list_items = items.clone();
+                    let list_handler = handler.clone();
+                    scroll(
+                        dyn_stack(
+                            move || list_items.clone(),
+                            |option| option.id.clone(),
+                            move |option| {
+                                let text = option.label.clone();
+                                let id = option.id.clone();
+                                let handler = list_handler.clone();
+                                label(move || text.clone())
+                                    .on_click_stop(move |_| {
+                                        handler(id.clone());
+                                        expanded.set(false);
+                                    })
+                                    .style(move |s| {
+                                        let config = overlay_config.get();
+                                        s.width_pct(100.0)
+                                            .min_height(24.0)
+                                            .items_center()
+                                            .padding_horiz(10.0)
+                                            .padding_vert(3.0)
+                                            .text_ellipsis()
+                                            .font_size(
+                                                config.ui.font_size() as f32 - 1.0,
+                                            )
+                                            .color(config.color(
+                                                LapceColor::EDITOR_FOREGROUND,
+                                            ))
+                                            .cursor(CursorStyle::Pointer)
+                                            .selectable(false)
+                                            .hover(|s| {
+                                                s.background(config.color(
+                                                LapceColor::PANEL_HOVERED_BACKGROUND,
+                                            ))
+                                            })
+                                    })
+                                    .into_any()
+                            },
+                        )
+                        .style(|s| s.flex_col().width_pct(100.0)),
                     )
+                    .style(move |s| {
+                        let config = overlay_config.get();
+                        let origin = window_origin.get();
+                        let size = control_size.get();
+                        let list = list_size.get();
+                        let window = window_size.get();
+
+                        let width = size.width.max(180.0);
+                        let x = if origin.x + width + 6.0 > window.width {
+                            (window.width - width - 6.0).max(0.0)
+                        } else {
+                            origin.x
+                        };
+                        let y = if origin.y + size.height + list.height + 6.0
+                            > window.height
+                        {
+                            origin.y - list.height + 1.0
+                        } else {
+                            origin.y + size.height - 1.0
+                        };
+
+                        s.width(width)
+                            .max_height(260.0)
+                            .background(config.color(LapceColor::EDITOR_BACKGROUND))
+                            .border(1.0)
+                            .border_radius(6.0)
+                            .border_color(config.color(LapceColor::LAPCE_BORDER))
+                            .box_shadow_blur(6.0)
+                            .box_shadow_color(
+                                config.color(LapceColor::LAPCE_DROPDOWN_SHADOW),
+                            )
+                            .inset_left(x)
+                            .inset_top(y)
+                            .set(PropagatePointerWheel, false)
+                    })
+                    .on_resize(move |rect| list_size.set(rect.size()))
+                    .keyboard_navigable()
+                    .request_focus(|| {})
+                    .on_event_stop(EventListener::FocusGained, move |_| {
+                        list_focus.set(true);
+                    })
+                    .on_event_stop(EventListener::FocusLost, move |_| {
+                        list_focus.set(false);
+                        if !control_focus.get_untracked() {
+                            expanded.set(false);
+                        }
+                    })
+                    .on_event_stop(EventListener::PointerMove, |_| {})
+                    .into_any()
+                });
+            overlay_id.set(Some(id));
+        } else if let Some(id) = overlay_id.get_untracked() {
+            remove_overlay(id);
+            overlay_id.set(None);
+        }
+    });
+
+    let control = stack((
+        label(move || current_label()).style(move |s| {
+            let config = config.get();
+            s.min_width(0.0)
+                .text_ellipsis()
+                .font_size(if chrome == SelectChrome::Plain {
+                    config.ui.font_size() as f32 + 2.0
+                } else {
+                    config.ui.font_size() as f32 - 1.0
                 })
-                .class(ScrollClass, move |s| {
-                    let lapce_config = config.get();
-                    s.background(lapce_config.color(LapceColor::PANEL_BACKGROUND))
-                        .border(1.0)
-                        .border_radius(6.0)
-                        .border_color(lapce_config.color(LapceColor::LAPCE_BORDER))
-                        .padding_vert(4.0)
-                        .min_width(180.0)
-                        .max_width(360.0)
-                })
-        })
+                .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                .selectable(false)
+        }),
+        empty().style(|s| s.flex_grow(1.0)),
+        label(|| "▾".to_string()).style(move |s| {
+            let config = config.get();
+            s.font_size(config.ui.font_size() as f32 - 2.0)
+                .color(config.color(LapceColor::EDITOR_DIM))
+                .selectable(false)
+        }),
+    ))
+    .on_click_stop(move |_| {
+        expanded.update(|expanded| *expanded = !*expanded);
+    })
+    .on_move(move |point| {
+        window_origin.set(point);
+        if expanded.get_untracked() {
+            expanded.set(false);
+        }
+    })
+    .on_resize(move |rect| control_size.set(rect.size()))
+    .style(move |s| {
+        let config = config.get();
+        s.flex_grow(1.0f32)
+            .min_width(0.0)
+            .max_width(max_width)
+            .items_center()
+            .gap(2.0)
+            .cursor(CursorStyle::Pointer)
+            .apply_if(chrome == SelectChrome::Bordered, |s| {
+                s.padding_horiz(7.0)
+                    .padding_vert(3.0)
+                    .border(1.0)
+                    .border_radius(5.0)
+                    .border_color(config.color(LapceColor::LAPCE_BORDER))
+                    .background(config.color(LapceColor::EDITOR_BACKGROUND))
+            })
+            .apply_if(chrome == SelectChrome::Plain, |s| {
+                s.padding_horiz(4.0).padding_vert(1.0)
+            })
+            .hover(|s| {
+                s.background(config.color(LapceColor::PANEL_HOVERED_BACKGROUND))
+            })
+    })
+    .keyboard_navigable()
+    .on_event_stop(EventListener::FocusGained, move |_| {
+        control_focus.set(true);
+    })
+    .on_event_stop(EventListener::FocusLost, move |_| {
+        control_focus.set(false);
+        if !list_focus.get_untracked() {
+            expanded.set(false);
+        }
+    })
+    .on_cleanup(move || {
+        if let Some(id) = overlay_id.get_untracked() {
+            remove_overlay(id);
+        }
+    });
+
+    control
 }
 
 fn option_label(text: String, config: ReadSignal<Arc<LapceConfig>>) -> impl View {
@@ -307,67 +370,36 @@ fn new_session_selector(
     config: ReadSignal<Arc<LapceConfig>>,
     is_busy: impl Fn() -> bool + Copy + 'static,
 ) -> impl View {
+    let window_size = agent.common.window_common.size;
     dyn_container(
-        move || agent.profiles.get(),
-        move |profiles| {
-            let items: im::Vector<ProfileChoice> = profiles
+        move || (agent.profiles.get(), is_busy()),
+        move |(profiles, busy)| {
+            if busy {
+                return empty().into_any();
+            }
+
+            let items: im::Vector<SelectOption> = profiles
                 .iter()
-                .map(|profile| ProfileChoice {
-                    name: profile.name.clone(),
+                .map(|profile| SelectOption {
+                    id: profile.name.clone(),
+                    label: profile.name.clone(),
                 })
                 .collect();
-            let Some(current) = items.get(0).cloned() else {
+            if items.is_empty() {
                 return empty().into_any();
-            };
+            }
 
             let select_agent = agent.clone();
-            Dropdown::new(move || current.clone(), items)
-                .on_accept(move |choice| {
-                    select_agent.new_session_with_profile(choice.name)
-                })
-                .main_view(move |_| {
-                    label(|| "+".to_string())
-                        .style(move |s| {
-                            let config = config.get();
-                            s.padding_horiz(6.0)
-                                .padding_vert(1.0)
-                                .border_radius(4.0)
-                                .color(config.color(LapceColor::EDITOR_FOREGROUND))
-                                .font_size(config.ui.font_size() as f32 + 3.0)
-                                .cursor(CursorStyle::Pointer)
-                                .selectable(false)
-                                .apply_if(is_busy(), |s| s.hide())
-                                .hover(|s| {
-                                    s.background(
-                                        config.color(
-                                            LapceColor::PANEL_HOVERED_BACKGROUND,
-                                        ),
-                                    )
-                                })
-                        })
-                        .into_any()
-                })
-                .list_item_view(move |item| {
-                    let text = item.selector_label();
-                    label(move || text.clone())
-                        .style(move |s| {
-                            let config = config.get();
-                            s.width_full()
-                                .padding_horiz(10.0)
-                                .padding_vert(5.0)
-                                .font_size(config.ui.font_size() as f32 - 1.0)
-                                .color(config.color(LapceColor::EDITOR_FOREGROUND))
-                                .hover(|s| {
-                                    s.background(
-                                        config.color(
-                                            LapceColor::PANEL_HOVERED_BACKGROUND,
-                                        ),
-                                    )
-                                })
-                        })
-                        .into_any()
-                })
-                .into_any()
+            select_control(
+                || "+".to_string(),
+                items,
+                move |name| select_agent.new_session_with_profile(name),
+                window_size,
+                config,
+                SelectChrome::Plain,
+                44.0,
+            )
+            .into_any()
         },
     )
 }
@@ -924,11 +956,11 @@ fn question_field(
             .into_any()
         }
         AgentQuestionKind::Select { options, .. } => {
-            let items: im::Vector<QuestionChoice> = options
+            let items: im::Vector<SelectOption> = options
                 .iter()
-                .map(|option| QuestionChoice {
-                    value: option.value.clone(),
-                    title: option.title.clone(),
+                .map(|option| SelectOption {
+                    id: option.value.clone(),
+                    label: option.title.clone(),
                 })
                 .collect();
             if items.is_empty() {
@@ -936,24 +968,25 @@ fn question_field(
             }
             let current_value = match values.get(&field.name) {
                 Some(AgentQuestionValue::Select(value)) => value.clone(),
-                _ => items
-                    .get(0)
-                    .map(|item| item.value.clone())
-                    .unwrap_or_default(),
+                _ => items.get(0).map(|item| item.id.clone()).unwrap_or_default(),
             };
-            let current = items
+            let current_label = items
                 .iter()
-                .find(|choice| choice.value == current_value)
-                .cloned()
-                .or_else(|| items.get(0).cloned())
-                .unwrap();
+                .find(|choice| choice.id == current_value)
+                .or_else(|| items.get(0))
+                .map(|choice| choice.label.clone())
+                .unwrap_or_default();
             let name = name.clone();
             let select_agent = agent.clone();
-            selector(
-                current,
+            let window_size = agent.common.window_common.size;
+            select_control(
+                move || current_label.clone(),
                 items,
-                move |choice| select_agent.set_question_select(&name, choice.value),
+                move |value| select_agent.set_question_select(&name, value),
+                window_size,
                 config,
+                SelectChrome::Bordered,
+                f32::MAX,
             )
             .into_any()
         }
@@ -1035,16 +1068,24 @@ fn options_panel(
         },
         move |(models, modes, config_options)| {
             let mut rows: Vec<AnyView> = Vec::new();
+            let window_size = agent.common.window_common.size;
 
-            if let Some(models) = models {
-                if let Some(row) = model_row(models, agent.clone(), config) {
-                    rows.push(row);
+            let model = models.and_then(|models| {
+                model_row(models, agent.clone(), config, window_size)
+            });
+            let mode = modes.and_then(|modes| {
+                mode_row(modes, agent.clone(), config, window_size)
+            });
+            match (model, mode) {
+                (Some(model), Some(mode)) => {
+                    rows.push(
+                        h_stack((model, mode))
+                            .style(|s| s.width_full().items_center().gap(10.0))
+                            .into_any(),
+                    );
                 }
-            }
-            if let Some(modes) = modes {
-                if let Some(row) = mode_row(modes, agent.clone(), config) {
-                    rows.push(row);
-                }
+                (Some(row), None) | (None, Some(row)) => rows.push(row),
+                (None, None) => {}
             }
             for option in config_options {
                 if let Some(row) = config_option_row(option, agent.clone(), config) {
@@ -1070,34 +1111,44 @@ fn model_row(
     state: AgentChoiceState,
     agent: AgentData,
     config: ReadSignal<Arc<LapceConfig>>,
+    window_size: RwSignal<Size>,
 ) -> Option<AnyView> {
-    let items: im::Vector<ModelChoice> = state
+    let items: im::Vector<SelectOption> = state
         .available
         .into_iter()
-        .map(|model| ModelChoice {
+        .map(|model| SelectOption {
             id: model.id,
-            name: model.name,
+            label: model.name,
         })
         .collect();
     if items.is_empty() {
         return None;
     }
-    let current = items
+    let name = items
         .iter()
         .find(|choice| choice.id == state.current)
-        .cloned()
-        .or_else(|| items.get(0).cloned())?;
+        .or_else(|| items.get(0))
+        .map(|choice| choice.label.clone())?;
 
-    let dropdown = selector(
-        current,
+    let dropdown = select_control(
+        move || name.clone(),
         items,
-        move |choice| agent.select_model(choice.id),
+        move |id| agent.select_model(id),
+        window_size,
         config,
+        SelectChrome::Bordered,
+        f32::MAX,
     );
 
     Some(
         h_stack((option_label("Model".to_string(), config), dropdown))
-            .style(|s| s.width_full().items_center().gap(6.0))
+            .style(|s| {
+                s.flex_grow(1.0f32)
+                    .flex_basis(0.0)
+                    .min_width(0.0)
+                    .items_center()
+                    .gap(6.0)
+            })
             .into_any(),
     )
 }
@@ -1106,34 +1157,44 @@ fn mode_row(
     state: AgentChoiceState,
     agent: AgentData,
     config: ReadSignal<Arc<LapceConfig>>,
+    window_size: RwSignal<Size>,
 ) -> Option<AnyView> {
-    let items: im::Vector<ModelChoice> = state
+    let items: im::Vector<SelectOption> = state
         .available
         .into_iter()
-        .map(|mode| ModelChoice {
+        .map(|mode| SelectOption {
             id: mode.id,
-            name: mode.name,
+            label: mode.name,
         })
         .collect();
     if items.is_empty() {
         return None;
     }
-    let current = items
+    let name = items
         .iter()
         .find(|choice| choice.id == state.current)
-        .cloned()
-        .or_else(|| items.get(0).cloned())?;
+        .or_else(|| items.get(0))
+        .map(|choice| choice.label.clone())?;
 
-    let dropdown = selector(
-        current,
+    let dropdown = select_control(
+        move || name.clone(),
         items,
-        move |choice| agent.select_mode(choice.id),
+        move |id| agent.select_mode(id),
+        window_size,
         config,
+        SelectChrome::Bordered,
+        f32::MAX,
     );
 
     Some(
         h_stack((option_label("Mode".to_string(), config), dropdown))
-            .style(|s| s.width_full().items_center().gap(6.0))
+            .style(|s| {
+                s.flex_grow(1.0f32)
+                    .flex_basis(0.0)
+                    .min_width(0.0)
+                    .items_center()
+                    .gap(6.0)
+            })
             .into_any(),
     )
 }
@@ -1147,33 +1208,37 @@ fn config_option_row(
 
     match kind {
         AgentConfigOptionKind::Select { current, options } => {
-            let items: im::Vector<ConfigValueChoice> = options
+            let items: Vec<SelectOption> = options
                 .into_iter()
-                .map(|option| ConfigValueChoice {
-                    value: option.value,
-                    name: option.name,
+                .map(|option| SelectOption {
+                    id: option.value,
+                    label: option.name,
                 })
                 .collect();
             if items.is_empty() {
                 return None;
             }
-            let current = items
+            let current_label = items
                 .iter()
-                .find(|choice| choice.value == current)
-                .cloned()
-                .or_else(|| items.get(0).cloned())?;
-
+                .find(|choice| choice.id == current)
+                .or_else(|| items.get(0))
+                .map(|choice| choice.label.clone())?;
+            let options: im::Vector<SelectOption> = items.into_iter().collect();
             let config_id = id;
-            let dropdown = selector(
-                current,
-                items,
-                move |choice| {
+            let window_size = agent.common.window_common.size;
+            let dropdown = select_control(
+                move || current_label.clone(),
+                options,
+                move |value| {
                     agent.set_config_option(
                         &config_id,
-                        AgentConfigValue::Select(choice.value),
+                        AgentConfigValue::Select(value),
                     )
                 },
+                window_size,
                 config,
+                SelectChrome::Bordered,
+                f32::MAX,
             );
 
             Some(

@@ -1468,10 +1468,23 @@ impl AgentData {
         }
 
         let mut config = self.common.config.get_untracked().agent.clone();
+        let mut env: Vec<(String, String)> = Vec::new();
         if let Some(profile) = self.profile.lock().clone() {
             if !profile.command.trim().is_empty() {
                 config.command = profile.command;
             }
+            env = profile
+                .env
+                .iter()
+                .filter_map(|entry| {
+                    let (key, value) = entry.split_once('=')?;
+                    let key = key.trim();
+                    if key.is_empty() {
+                        return None;
+                    }
+                    Some((key.to_string(), value.to_string()))
+                })
+                .collect();
         }
         let cwd = self
             .common
@@ -1505,7 +1518,7 @@ impl AgentData {
 
         let spawn_result = thread::Builder::new()
             .name("lapce-agent".to_string())
-            .spawn(move || run_agent(context, receiver, config, cwd, epoch));
+            .spawn(move || run_agent(context, receiver, config, cwd, env, epoch));
 
         if let Err(error) = spawn_result {
             self.running.store(false, Ordering::SeqCst);
@@ -1537,9 +1550,10 @@ fn run_agent(
     commands: Receiver<AgentCommand>,
     config: AgentConfig,
     cwd: PathBuf,
+    env: Vec<(String, String)>,
     epoch: u64,
 ) {
-    let result = run_agent_inner(&context, &commands, config, cwd);
+    let result = run_agent_inner(&context, &commands, config, cwd, env);
     if context.epoch.load(Ordering::SeqCst) != epoch {
         // Another agent was started while this one was shutting down.
         return;
@@ -1566,8 +1580,9 @@ fn run_agent_inner(
     commands: &Receiver<AgentCommand>,
     config: AgentConfig,
     cwd: PathBuf,
+    env: Vec<(String, String)>,
 ) -> Result<()> {
-    let mut connection = ProtocolConnection::spawn(context, config, cwd)?;
+    let mut connection = ProtocolConnection::spawn(context, config, cwd, env)?;
     if !connection.initialize(commands)? {
         return Ok(());
     }
@@ -1608,6 +1623,7 @@ impl ProtocolConnection {
         context: &AgentThread,
         config: AgentConfig,
         cwd: PathBuf,
+        env: Vec<(String, String)>,
     ) -> Result<Self> {
         let mut command = if cfg!(windows) {
             let mut command = Command::new("cmd");
@@ -1625,6 +1641,7 @@ impl ProtocolConnection {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("NO_COLOR", "1")
+            .envs(env)
             .spawn()
             .with_context(|| {
                 format!("Failed to start ACP agent `{}`", config.command)

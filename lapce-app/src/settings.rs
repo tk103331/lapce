@@ -53,6 +53,7 @@ pub enum SettingsValue {
     String(String),
     Bool(bool),
     Dropdown(DropdownInfo),
+    AgentProfiles,
     Empty,
 }
 
@@ -246,6 +247,25 @@ impl SettingsData {
                     });
                     item_height_accum += 50.0;
                 }
+
+                if kind == "Agent" {
+                    data_items.push_back(SettingsItem {
+                        kind: "agent".to_string(),
+                        name: "Agent: Profiles".to_string(),
+                        field: "profiles".to_string(),
+                        filter_text: "agent profiles acp agent".to_string(),
+                        description: "ACP agents available in the Agent panel. \
+                                      The + button in the panel header starts \
+                                      a new session with the selected agent."
+                            .to_string(),
+                        value: SettingsValue::AgentProfiles,
+                        serde_value: Value::Null,
+                        pos: cx.create_rw_signal(Point::ZERO),
+                        size: cx.create_rw_signal(Size::ZERO),
+                        header: false,
+                    });
+                    item_height_accum += 50.0;
+                }
             }
 
             filtered_items.set(data_items.clone());
@@ -344,7 +364,6 @@ pub fn settings_view(
     let cx = Scope::current();
     let settings_data = SettingsData::new(cx, installed_plugins, common.clone());
     let view_settings_data = settings_data.clone();
-    let section_settings_data = settings_data.clone();
     let plugin_kinds = settings_data.plugin_kinds;
 
     let search_editor = editors.make_local(cx, common);
@@ -517,31 +536,24 @@ pub fn settings_view(
             .style(|s| s.padding_horiz(50.0).padding_vert(20.0)),
             container({
                 scroll({
-                    stack((
-                        dyn_stack(
-                            move || filtered_items_signal.get(),
-                            |item| {
-                                (
-                                    item.kind.clone(),
-                                    item.name.clone(),
-                                    item.serde_value.clone(),
-                                )
-                            },
-                            move |item| {
-                                settings_item_view(
-                                    editors,
-                                    view_settings_data.clone(),
-                                    item,
-                                )
-                            },
-                        )
-                        .style(|s| s.flex_col()),
-                        agent_profiles_section(
-                            editors,
-                            section_settings_data.common.clone(),
-                            config,
-                        ),
-                    ))
+                    stack((dyn_stack(
+                        move || filtered_items_signal.get(),
+                        |item| {
+                            (
+                                item.kind.clone(),
+                                item.name.clone(),
+                                item.serde_value.clone(),
+                            )
+                        },
+                        move |item| {
+                            settings_item_view(
+                                editors,
+                                view_settings_data.clone(),
+                                item,
+                            )
+                        },
+                    )
+                    .style(|s| s.flex_col()),))
                     .style(|s| {
                         s.flex_col()
                             .padding_horiz(50.0)
@@ -610,6 +622,13 @@ fn agent_profiles_section(
             stack_from_iter(profiles.into_iter().map(move |profile| {
                 let name = profile.name.clone();
                 let command = profile.command.clone();
+                let env_summary = if profile.env.is_empty() {
+                    String::new()
+                } else {
+                    format!("env: {}", profile.env.join(", "))
+                };
+                let env_visible = !env_summary.is_empty();
+                let env_text = env_summary.clone();
                 let row_name = name.clone();
                 let row_common = common.clone();
                 let delete_common = common.clone();
@@ -633,6 +652,15 @@ fn agent_profiles_section(
                                 .font_size(config.ui.font_size() as f32 - 1.0)
                                 .color(config.color(LapceColor::EDITOR_DIM))
                                 .selectable(false)
+                        }),
+                        label(move || env_text.clone()).style(move |s| {
+                            let config = config.get();
+                            s.width_full()
+                                .text_ellipsis()
+                                .font_size(config.ui.font_size() as f32 - 1.5)
+                                .color(config.color(LapceColor::EDITOR_DIM))
+                                .selectable(false)
+                                .apply_if(!env_visible, |s| s.hide())
                         }),
                     ))
                     .style(|s| s.flex_col().flex_grow(1.0f32).min_width(0.0)),
@@ -704,33 +732,8 @@ fn agent_profiles_section(
         },
     );
 
-    stack((
-        label(|| "Agent: Profiles".to_string()).style(move |s| {
-            let config = config.get();
-            s.width_full()
-                .line_height(2.0)
-                .font_bold()
-                .font_size(config.ui.font_size() as f32 + 2.0)
-                .padding_horiz(10.0)
-                .background(config.color(LapceColor::PANEL_BACKGROUND))
-        }),
-        label(|| {
-            "ACP agents available in the Agent panel. The + button in the \
-             panel header starts a new session with the selected agent."
-                .to_string()
-        })
-        .style(move |s| {
-            let config = config.get();
-            s.width_full()
-                .font_size(config.ui.font_size() as f32 - 1.0)
-                .color(config.color(LapceColor::EDITOR_DIM))
-                .selectable(false)
-        }),
-        rows,
-        container(add).style(|s| s.padding_vert(6.0)),
-        form,
-    ))
-    .style(|s| s.width_full().flex_col().gap(6.0).padding_top(20.0))
+    stack((rows, container(add).style(|s| s.padding_vert(6.0)), form))
+        .style(|s| s.width_full().flex_col().gap(6.0))
 }
 
 fn agent_profile_form(
@@ -765,6 +768,15 @@ fn agent_profile_form(
         )
         .build(cx, editors, common.clone());
     let command_editor = command_input.editor();
+    let env_input = TextInputBuilder::new()
+        .value(
+            existing
+                .as_ref()
+                .map(|profile| profile.env.join(", "))
+                .unwrap_or_default(),
+        )
+        .build(cx, editors, common.clone());
+    let env_editor = env_input.editor();
 
     let cancel_editing = editing;
     let save_common = common.clone();
@@ -772,9 +784,17 @@ fn agent_profile_form(
 
     stack((
         name_input
+            .placeholder(|| "Agent name".to_string())
             .style(move |s| s.width_full().border_radius(5.0))
             .keyboard_navigable(),
         command_input
+            .placeholder(|| "Command, e.g. gemini --experimental-acp".to_string())
+            .style(move |s| s.width_full().border_radius(5.0))
+            .keyboard_navigable(),
+        env_input
+            .placeholder(|| {
+                "Environment: KEY=value, KEY2=value2 (optional)".to_string()
+            })
             .style(move |s| s.width_full().border_radius(5.0))
             .keyboard_navigable(),
         h_stack((
@@ -793,6 +813,15 @@ fn agent_profile_form(
                         .with(|buffer| buffer.to_string())
                         .trim()
                         .to_string();
+                    let env: Vec<String> = env_editor
+                        .doc()
+                        .buffer
+                        .with(|buffer| buffer.to_string())
+                        .split([',', '\n'])
+                        .map(str::trim)
+                        .filter(|entry| !entry.is_empty())
+                        .map(str::to_string)
+                        .collect();
                     if name.is_empty() || command.is_empty() {
                         return;
                     }
@@ -807,6 +836,7 @@ fn agent_profile_form(
                     profiles.push(AgentProfile {
                         name: name.clone(),
                         command,
+                        env,
                     });
                     let active = if active == save_original || active.is_empty() {
                         name
@@ -860,6 +890,7 @@ fn settings_item_view(
         SettingsValue::String(s) => Some(s.to_string()),
         SettingsValue::Bool(_) => None,
         SettingsValue::Dropdown(_) => None,
+        SettingsValue::AgentProfiles => None,
         SettingsValue::Empty => None,
     };
 
@@ -964,6 +995,9 @@ fn settings_item_view(
                     config,
                 )
                 .into_any()
+            } else if matches!(item.value, SettingsValue::AgentProfiles) {
+                agent_profiles_section(editors, settings_data.common.clone(), config)
+                    .into_any()
             } else if item.header {
                 label(move || item.kind.clone())
                     .style(move |s| {
