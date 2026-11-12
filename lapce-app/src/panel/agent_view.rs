@@ -1067,8 +1067,8 @@ fn options_panel(
             )
         },
         move |(models, modes, config_options)| {
-            let mut rows: Vec<AnyView> = Vec::new();
             let window_size = agent.common.window_common.size;
+            let has_configs = !config_options.is_empty();
 
             let model = models.and_then(|models| {
                 model_row(models, agent.clone(), config, window_size)
@@ -1076,35 +1076,181 @@ fn options_panel(
             let mode = modes.and_then(|modes| {
                 mode_row(modes, agent.clone(), config, window_size)
             });
-            match (model, mode) {
-                (Some(model), Some(mode)) => {
-                    rows.push(
-                        h_stack((model, mode))
-                            .style(|s| s.width_full().items_center().gap(10.0))
-                            .into_any(),
-                    );
-                }
-                (Some(row), None) | (None, Some(row)) => rows.push(row),
-                (None, None) => {}
+            let config_button = has_configs
+                .then(|| config_popover(agent.clone(), config, window_size));
+
+            let mut selectors: Vec<AnyView> = Vec::new();
+            if let Some(model) = model {
+                selectors.push(model);
             }
-            for option in config_options {
-                if let Some(row) = config_option_row(option, agent.clone(), config) {
-                    rows.push(row);
-                }
+            if let Some(mode) = mode {
+                selectors.push(mode);
+            }
+            if let Some(button) = config_button {
+                selectors.push(
+                    container(button)
+                        .style(|s| s.items_center().padding_left(2.0))
+                        .into_any(),
+                );
             }
 
-            if rows.is_empty() {
+            if selectors.is_empty() {
                 return empty().into_any();
             }
 
-            scroll(
-                stack_from_iter(rows).style(|s| s.flex_col().width_full().gap(3.0)),
-            )
-            .scroll_style(|s| s.hide_bars(true))
-            .style(|s| s.width_full().max_height(150.0))
-            .into_any()
+            stack_from_iter(selectors)
+                .style(|s| s.width_full().items_center().gap(10.0))
+                .into_any()
         },
     )
+}
+
+/// A gear button that shows the remaining ACP config options in a popover.
+fn config_popover(
+    agent: AgentData,
+    config: ReadSignal<Arc<LapceConfig>>,
+    window_size: RwSignal<Size>,
+) -> impl View {
+    let expanded = create_rw_signal(false);
+    let origin = create_rw_signal(Point::ZERO);
+    let button_size = create_rw_signal(Size::ZERO);
+    let popup_size = create_rw_signal(Size::ZERO);
+    let overlay_id = create_rw_signal(None);
+    let button_focus = create_rw_signal(false);
+    let popup_focus = create_rw_signal(false);
+
+    let popup_agent = agent.clone();
+    let popup_config = config;
+    create_effect(move |_| {
+        if expanded.get() {
+            let options_agent = popup_agent.clone();
+            let id = add_overlay(Point::ZERO, move |_| {
+                let rows_agent = options_agent.clone();
+                let popup = stack((
+                    label(|| "Options".to_string()).style(move |s| {
+                        let config = popup_config.get();
+                        s.width_full()
+                            .font_size(config.ui.font_size() as f32 - 1.0)
+                            .color(config.color(LapceColor::EDITOR_DIM))
+                            .selectable(false)
+                    }),
+                    scroll(dyn_container(
+                        move || rows_agent.config_options.get(),
+                        move |options| {
+                            let rows = options.into_iter().filter_map(|option| {
+                                config_option_row(
+                                    option,
+                                    rows_agent.clone(),
+                                    popup_config,
+                                )
+                            });
+                            stack_from_iter(rows)
+                                .style(|s| s.flex_col().width_full().gap(6.0))
+                        },
+                    ))
+                    .scroll_style(|s| s.hide_bars(true))
+                    .style(|s| s.width_full().max_height(260.0)),
+                ))
+                .style(move |s| {
+                    let config = popup_config.get();
+                    s.flex_col()
+                        .width_full()
+                        .gap(6.0)
+                        .padding(10.0)
+                        .border(1.0)
+                        .border_radius(6.0)
+                        .border_color(config.color(LapceColor::LAPCE_BORDER))
+                        .background(config.color(LapceColor::EDITOR_BACKGROUND))
+                });
+
+                let popup = container(popup).style(move |s| {
+                    let config = popup_config.get();
+                    let origin = origin.get();
+                    let size = button_size.get();
+                    let popup = popup_size.get();
+                    let window = window_size.get();
+
+                    let width = popup.width.max(240.0).min(360.0);
+                    let x = if origin.x + width + 8.0 > window.width {
+                        (window.width - width - 8.0).max(8.0)
+                    } else {
+                        origin.x
+                    };
+                    let y = if origin.y + size.height + popup.height + 8.0
+                        > window.height
+                    {
+                        (origin.y - popup.height - 4.0).max(8.0)
+                    } else {
+                        origin.y + size.height + 4.0
+                    };
+
+                    s.width(width)
+                        .background(config.color(LapceColor::EDITOR_BACKGROUND))
+                        .border(1.0)
+                        .border_radius(8.0)
+                        .border_color(config.color(LapceColor::LAPCE_BORDER))
+                        .box_shadow_blur(6.0)
+                        .box_shadow_color(
+                            config.color(LapceColor::LAPCE_DROPDOWN_SHADOW),
+                        )
+                        .inset_left(x)
+                        .inset_top(y)
+                        .set(PropagatePointerWheel, false)
+                });
+
+                popup
+                    .on_resize(move |rect| popup_size.set(rect.size()))
+                    .keyboard_navigable()
+                    .request_focus(|| {})
+                    .on_event_stop(EventListener::FocusGained, move |_| {
+                        popup_focus.set(true);
+                    })
+                    .on_event_stop(EventListener::FocusLost, move |_| {
+                        popup_focus.set(false);
+                        if !button_focus.get_untracked() {
+                            expanded.set(false);
+                        }
+                    })
+                    .on_event_stop(EventListener::PointerMove, |_| {})
+                    .into_any()
+            });
+            overlay_id.set(Some(id));
+        } else if let Some(id) = overlay_id.get_untracked() {
+            remove_overlay(id);
+            overlay_id.set(None);
+        }
+    });
+
+    clickable_icon(
+        || LapceIcons::SETTINGS,
+        move || expanded.update(|expanded| *expanded = !*expanded),
+        move || expanded.get(),
+        || false,
+        || "Options",
+        config,
+    )
+    .on_move(move |point| {
+        origin.set(point);
+        if expanded.get_untracked() {
+            expanded.set(false);
+        }
+    })
+    .on_resize(move |rect| button_size.set(rect.size()))
+    .keyboard_navigable()
+    .on_event_stop(EventListener::FocusGained, move |_| {
+        button_focus.set(true);
+    })
+    .on_event_stop(EventListener::FocusLost, move |_| {
+        button_focus.set(false);
+        if !popup_focus.get_untracked() {
+            expanded.set(false);
+        }
+    })
+    .on_cleanup(move || {
+        if let Some(id) = overlay_id.get_untracked() {
+            remove_overlay(id);
+        }
+    })
 }
 
 fn model_row(

@@ -15,6 +15,7 @@
 - The Agent panel keeps a session history that can be reopened
 - Agent composer accepts typing and submits on Enter
 - Agent profiles live with the Agent settings and support environment variables
+- Model and mode share a row with a settings button for the remaining ACP options
 
 ### Bug Fixes
 
