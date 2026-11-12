@@ -19,6 +19,8 @@
 - ACP agents must pass a startup check before they can be enabled
 - Only enabled agents are offered when starting a new session
 - Session history sits at the end of the panel header and restores its agent
+- Markdown code blocks and tool output render in monospace panels with a copy action
+- Thinking output is shown as a collapsible, dimmed block
 
 ### Bug Fixes
 

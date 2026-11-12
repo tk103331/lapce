@@ -1527,24 +1527,37 @@ fn message_view(
             }
             AgentRole::Thought => {
                 if expanded {
-                    markdown_text(message.content, config)
+                    container(markdown_view(message.content, config, true))
                         .style(move |s| {
-                            s.color(config.get().color(LapceColor::EDITOR_DIM))
+                            s.width_full()
+                                .min_width(0.0)
+                                .padding_left(8.0)
+                                .border_left(2.0)
+                                .border_color(
+                                    config.get().color(LapceColor::LAPCE_BORDER),
+                                )
                         })
                         .into_any()
                 } else {
                     let preview = preview_text(&message.content);
-                    label(move || preview.clone())
-                        .style(move |s| {
-                            let config = config.get();
-                            s.width_full()
-                                .min_width(0.0)
-                                .text_ellipsis()
-                                .color(config.color(LapceColor::EDITOR_DIM))
-                                .font_size(config.ui.font_size() as f32 - 1.0)
-                                .selectable(false)
-                        })
-                        .into_any()
+                    container(label(move || preview.clone()).style(move |s| {
+                        let config = config.get();
+                        s.width_full()
+                            .min_width(0.0)
+                            .text_ellipsis()
+                            .color(config.color(LapceColor::EDITOR_DIM))
+                            .font_size(config.ui.font_size() as f32 - 1.0)
+                            .selectable(false)
+                    }))
+                    .style(move |s| {
+                        let config = config.get();
+                        s.width_full()
+                            .min_width(0.0)
+                            .padding_left(8.0)
+                            .border_left(2.0)
+                            .border_color(config.color(LapceColor::LAPCE_BORDER))
+                    })
+                    .into_any()
                 }
             }
             AgentRole::Plan => markdown_text(message.content, config).into_any(),
@@ -1604,6 +1617,7 @@ fn tool_message(
     let has_content = !content.is_empty();
     let body_content = content.clone();
     let copy_content = content;
+    let line_count = body_content.lines().count();
 
     let toggle_agent = agent.clone();
     let expanded = agent.expanded_tools;
@@ -1640,7 +1654,13 @@ fn tool_message(
             move || body_agent.expanded_tools.get().contains(&tool_id),
             move |expanded| {
                 if expanded {
-                    markdown_text(body_content.clone(), config).into_any()
+                    code_block_view(
+                        String::new(),
+                        body_content.clone(),
+                        config,
+                        false,
+                    )
+                    .into_any()
                 } else {
                     let preview = preview_text(&body_content);
                     label(move || preview.clone())
@@ -1687,6 +1707,13 @@ fn tool_message(
                     .selectable(false)
             }),
             empty().style(|s| s.flex_grow(1.0)),
+            label(move || format!("{line_count} lines")).style(move |s| {
+                let config = config.get();
+                s.font_size(config.ui.font_size() as f32 - 1.5)
+                    .color(config.color(LapceColor::EDITOR_DIM))
+                    .selectable(false)
+                    .apply_if(!has_content, |s| s.hide())
+            }),
             toggle,
             copy,
         ))
@@ -1735,30 +1762,214 @@ fn markdown_text(
     content: String,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
+    markdown_view(content, config, false)
+}
+
+enum MarkdownSegment {
+    Text(String),
+    Code { language: String, code: String },
+}
+
+fn split_markdown_segments(text: &str) -> Vec<MarkdownSegment> {
+    let mut segments = Vec::new();
+    let mut text_buffer = String::new();
+    let mut code_buffer = String::new();
+    let mut language = String::new();
+    let mut in_code = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(fence) = trimmed.strip_prefix("```") {
+            if in_code {
+                segments.push(MarkdownSegment::Code {
+                    language: language.clone(),
+                    code: code_buffer.clone(),
+                });
+                code_buffer.clear();
+                language.clear();
+                in_code = false;
+            } else {
+                if !text_buffer.is_empty() {
+                    segments.push(MarkdownSegment::Text(std::mem::take(
+                        &mut text_buffer,
+                    )));
+                }
+                language = fence.trim().to_string();
+                in_code = true;
+            }
+            continue;
+        }
+
+        if in_code {
+            code_buffer.push_str(line);
+            code_buffer.push('\n');
+        } else {
+            text_buffer.push_str(line);
+            text_buffer.push('\n');
+        }
+    }
+
+    if in_code {
+        segments.push(MarkdownSegment::Code {
+            language,
+            code: code_buffer,
+        });
+    } else if !text_buffer.trim().is_empty() {
+        segments.push(MarkdownSegment::Text(text_buffer));
+    }
+
+    segments
+}
+
+fn markdown_view(
+    content: String,
+    config: ReadSignal<Arc<LapceConfig>>,
+    dim: bool,
+) -> impl View {
     dyn_container(
-        move || parse_markdown(&content, 1.6, &config.get()),
-        move |blocks| {
-            stack_from_iter(blocks.into_iter().map(move |block| {
-                match block {
-                    MarkdownContent::Text(text_layout) => {
-                        rich_text(move || text_layout.clone())
-                            .style(|s| s.width_full().min_width(0.0))
-                            .into_any()
+        move || split_markdown_segments(&content),
+        move |segments| {
+            let mut views: Vec<AnyView> = Vec::new();
+            for segment in segments {
+                match segment {
+                    MarkdownSegment::Text(text) => {
+                        for block in parse_markdown(&text, 1.6, &config.get()) {
+                            match block {
+                                MarkdownContent::Text(text_layout) => {
+                                    views.push(
+                                        rich_text(move || text_layout.clone())
+                                            .style(move |s| {
+                                                let s = s
+                                                    .width_full()
+                                                    .min_width(0.0)
+                                                    .padding_horiz(2.0);
+                                                if dim {
+                                                    s.color(config.get().color(
+                                                        LapceColor::EDITOR_DIM,
+                                                    ))
+                                                } else {
+                                                    s
+                                                }
+                                            })
+                                            .into_any(),
+                                    );
+                                }
+                                MarkdownContent::Image { .. } => {}
+                                MarkdownContent::Separator => {
+                                    views.push(
+                                        container(empty().style(move |s| {
+                                            s.width_full()
+                                                .height(1.0)
+                                                .margin_vert(4.0)
+                                                .background(
+                                                    config.get().color(
+                                                        LapceColor::LAPCE_BORDER,
+                                                    ),
+                                                )
+                                        }))
+                                        .into_any(),
+                                    );
+                                }
+                            }
+                        }
                     }
-                    MarkdownContent::Image { .. } => empty().into_any(),
-                    MarkdownContent::Separator => {
-                        container(empty().style(move |s| {
-                            s.width_full().height(1.0).margin_vert(4.0).background(
-                                config.get().color(LapceColor::LAPCE_BORDER),
-                            )
-                        }))
-                        .into_any()
+                    MarkdownSegment::Code { language, code } => {
+                        views.push(
+                            code_block_view(language, code, config, true).into_any(),
+                        );
                     }
                 }
-            }))
-            .style(|s| s.flex_col().width_full().min_width(0.0))
+            }
+
+            stack_from_iter(views)
+                .style(|s| s.flex_col().width_full().min_width(0.0).gap(4.0))
         },
     )
+}
+
+/// A fenced code block (or a raw log output) with a header and a scrollable
+/// monospace body.
+fn code_block_view(
+    language: String,
+    code: String,
+    config: ReadSignal<Arc<LapceConfig>>,
+    show_copy: bool,
+) -> impl View {
+    let line_count = code.lines().count();
+    let copy_source = code.clone();
+    let body_code = code.clone();
+    let language_label = language.clone();
+    let language_hidden = language.is_empty();
+
+    let header = h_stack((
+        label(move || language_label.clone()).style(move |s| {
+            let config = config.get();
+            s.font_size(config.ui.font_size() as f32 - 1.0)
+                .color(config.color(LapceColor::EDITOR_DIM))
+                .selectable(false)
+                .apply_if(language_hidden, |s| s.hide())
+        }),
+        empty().style(|s| s.flex_grow(1.0)),
+        label(move || format!("{line_count} lines")).style(move |s| {
+            let config = config.get();
+            s.font_size(config.ui.font_size() as f32 - 1.5)
+                .color(config.color(LapceColor::EDITOR_DIM))
+                .selectable(false)
+        }),
+        if show_copy {
+            copy_icon(move || copy_source.clone(), config).into_any()
+        } else {
+            empty().into_any()
+        },
+    ))
+    .style(|s| s.width_full().items_center().gap(6.0));
+
+    let lines: Vec<String> = if body_code.is_empty() {
+        Vec::new()
+    } else {
+        body_code
+            .lines()
+            .map(|line| {
+                if line.is_empty() {
+                    " ".to_string()
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect()
+    };
+
+    let body = scroll(
+        stack_from_iter(lines.into_iter().map(|line| {
+            label(move || line.clone())
+                .style(move |s| {
+                    let config = config.get();
+                    s.width_full()
+                        .min_width(0.0)
+                        .font_family(config.editor.font_family.clone())
+                        .font_size(config.ui.font_size() as f32 - 0.5)
+                        .color(config.color(LapceColor::EDITOR_FOREGROUND))
+                        .selectable(true)
+                })
+                .into_any()
+        }))
+        .style(|s| s.flex_col().width_full().min_width(0.0)),
+    )
+    .scroll_style(|s| s.hide_bars(true))
+    .style(|s| s.width_full().max_height(300.0));
+
+    stack((header, body)).style(move |s| {
+        let config = config.get();
+        s.width_full()
+            .min_width(0.0)
+            .flex_col()
+            .gap(4.0)
+            .padding(8.0)
+            .border_radius(6.0)
+            .border(1.0)
+            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .background(config.color(LapceColor::PANEL_CURRENT_BACKGROUND))
+    })
 }
 
 fn permission_view(
