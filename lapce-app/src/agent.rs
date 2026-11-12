@@ -1096,6 +1096,8 @@ impl AgentData {
             if let Some(sender) = self.sender.lock().as_ref() {
                 let _ = sender.send(AgentCommand::UseSession(resume));
             }
+        } else {
+            self.ensure_started();
         }
     }
 
