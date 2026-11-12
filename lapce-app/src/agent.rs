@@ -15,8 +15,10 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -239,6 +241,123 @@ pub struct AgentContextUsage {
 pub struct AgentCost {
     pub amount: f64,
     pub currency: String,
+}
+
+/// Result of checking whether an agent can start and speak ACP.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentDetection {
+    Passed(String),
+    Failed(String),
+}
+
+/// Start an agent, run the ACP `initialize` handshake and stop it again.
+pub fn detect_agent(
+    command: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<String> {
+    let mut process = if cfg!(windows) {
+        let mut process = Command::new("cmd");
+        process.arg("/C").arg(command);
+        process
+    } else {
+        let mut process = Command::new("sh");
+        process.arg("-c").arg(command);
+        process
+    };
+
+    let mut child = process
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env("NO_COLOR", "1")
+        .envs(env.iter().cloned())
+        .spawn()
+        .with_context(|| format!("Failed to start `{command}`"))?;
+
+    let result = (|| -> Result<String> {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("Agent stdin is not available"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("Agent stdout is not available"))?;
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "fs": { "readTextFile": true, "writeTextFile": true },
+                    "terminal": false,
+                    "elicitation": { "form": {} },
+                },
+                "clientInfo": {
+                    "name": "Lapce",
+                    "title": "Lapce",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        });
+        writeln!(stdin, "{request}")?;
+        stdin.flush()?;
+
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("lapce-agent-detect".to_string())
+            .spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            if sender.send(line).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })?;
+
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("Timed out waiting for the agent to initialize");
+            }
+            let line = match receiver.recv_timeout(remaining) {
+                Ok(line) => line,
+                Err(_) => bail!("Timed out waiting for the agent to initialize"),
+            };
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            if message["id"].as_u64() != Some(1) {
+                continue;
+            }
+            if let Some(error) =
+                message.get("error").filter(|error| !error.is_null())
+            {
+                let message = error["message"].as_str().unwrap_or("Unknown error");
+                bail!("{message}");
+            }
+            let title = message["result"]["agentInfo"]["title"]
+                .as_str()
+                .or_else(|| message["result"]["agentInfo"]["name"].as_str())
+                .unwrap_or("Agent")
+                .to_string();
+            return Ok(title);
+        }
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    result
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1069,6 +1188,17 @@ impl AgentData {
 
         let same_profile =
             agent.is_empty() || self.active_profile.get_untracked() == agent;
+        if !agent.is_empty() {
+            if let Some(profile) = self
+                .profiles
+                .get_untracked()
+                .iter()
+                .find(|profile| profile.name == agent)
+                .cloned()
+            {
+                *self.profile.lock() = Some(profile);
+            }
+        }
         if !same_profile {
             self.store.lock().archive_current();
             self.apply_profile(&agent);

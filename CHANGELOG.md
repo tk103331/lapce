@@ -16,6 +16,9 @@
 - Agent composer accepts typing and submits on Enter
 - Agent profiles live with the Agent settings and support environment variables
 - Model and mode share a row with a settings button for the remaining ACP options
+- ACP agents must pass a startup check before they can be enabled
+- Only enabled agents are offered when starting a new session
+- Session history sits at the end of the panel header and restores its agent
 
 ### Bug Fixes
 

@@ -1014,6 +1014,7 @@ impl LapceConfig {
                 }
                 table.insert("env", toml_edit::value(env));
             }
+            table.insert("enabled", toml_edit::value(profile.enabled));
             agents.push(table);
         }
         agent.insert("agents", toml_edit::Item::ArrayOfTables(agents));

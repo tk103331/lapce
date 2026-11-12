@@ -4,6 +4,7 @@ use floem::{
     IntoView, View,
     action::{TimerToken, add_overlay, exec_after, remove_overlay},
     event::EventListener,
+    ext_event::create_signal_from_channel,
     keyboard::Modifiers,
     peniko::kurbo::{Point, Rect, Size},
     reactive::{
@@ -28,6 +29,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
+    agent::{AgentDetection, detect_agent},
     command::CommandExecuted,
     config::{
         DropdownInfo, LapceConfig,
@@ -45,6 +47,15 @@ use crate::{
     text_input::TextInputBuilder,
     window_tab::CommonData,
 };
+
+static SETTINGS_SECTION_REQUEST: parking_lot::Mutex<Option<String>> =
+    parking_lot::Mutex::new(None);
+
+/// Ask the settings page to scroll to the given section the next time it is
+/// displayed or rebuilt.
+pub fn request_settings_section(kind: &str) {
+    *SETTINGS_SECTION_REQUEST.lock() = Some(kind.to_string());
+}
 
 #[derive(Debug, Clone)]
 pub enum SettingsValue {
@@ -425,6 +436,29 @@ pub fn settings_view(
         })
     };
 
+    {
+        let kinds_signal = kinds;
+        let ensure_visible = ensure_visible;
+        create_effect(move |_| {
+            let kinds = kinds_signal.get();
+            let Some(target) = SETTINGS_SECTION_REQUEST.lock().take() else {
+                return;
+            };
+            let Some((_, pos)) = kinds
+                .iter()
+                .find(|(kind, _)| kind.eq_ignore_ascii_case(&target))
+            else {
+                return;
+            };
+            ensure_visible.set(
+                settings_content_size
+                    .get_untracked()
+                    .to_rect()
+                    .with_origin(pos.get_untracked()),
+            );
+        });
+    }
+
     let switcher_item = move |k: String,
                               pos: Box<dyn Fn() -> Option<RwSignal<Point>>>,
                               margin: f32| {
@@ -606,6 +640,21 @@ fn settings_action_button(
         })
 }
 
+fn set_profile_enabled(common: &Rc<CommonData>, name: &str, enabled: bool) {
+    let agent = common.config.get_untracked().agent.clone();
+    let active = agent.active_profile().name;
+    let mut profiles = agent.profiles();
+    if let Some(profile) = profiles.iter_mut().find(|profile| profile.name == name) {
+        if profile.enabled == enabled {
+            return;
+        }
+        profile.enabled = enabled;
+    } else {
+        return;
+    }
+    LapceConfig::update_agent_profiles(&profiles, &active);
+}
+
 fn agent_profiles_section(
     editors: Editors,
     common: Rc<CommonData>,
@@ -613,15 +662,42 @@ fn agent_profiles_section(
 ) -> impl View {
     let editing = create_rw_signal(false);
     let original = create_rw_signal(String::new());
+    let testing = create_rw_signal(Option::<String>::None);
+    let detections = create_rw_signal(im::HashMap::<String, AgentDetection>::new());
+
+    let (sender, receiver) =
+        std::sync::mpsc::channel::<(String, Result<String, String>)>();
+    let detections_signal = create_signal_from_channel(receiver);
+    let detect_common = common.clone();
+    create_effect(move |_| {
+        let Some((name, result)) = detections_signal.get() else {
+            return;
+        };
+        testing.set(None);
+        let detection = match result {
+            Ok(title) => AgentDetection::Passed(title),
+            Err(error) => AgentDetection::Failed(error),
+        };
+        let passed = matches!(detection, AgentDetection::Passed(_));
+        detections.update(|detections| {
+            detections.insert(name.clone(), detection);
+        });
+        if passed {
+            set_profile_enabled(&detect_common, &name, true);
+        }
+    });
 
     let rows_common = common.clone();
     let rows = dyn_container(
         move || config.get().agent.profiles(),
         move |profiles| {
             let common = rows_common.clone();
+            let sender = sender.clone();
             stack_from_iter(profiles.into_iter().map(move |profile| {
                 let name = profile.name.clone();
                 let command = profile.command.clone();
+                let env = profile.env.clone();
+                let enabled = profile.enabled;
                 let env_summary = if profile.env.is_empty() {
                     String::new()
                 } else {
@@ -629,34 +705,82 @@ fn agent_profiles_section(
                 };
                 let env_visible = !env_summary.is_empty();
                 let env_text = env_summary.clone();
+
                 let row_name = name.clone();
-                let row_common = common.clone();
+                let checkbox_name = name.clone();
+                let checkbox_common = common.clone();
+                let detect_name = name.clone();
+                let detect_command = command.clone();
+                let detect_env = env.clone();
+                let detect_common = common.clone();
+                let detect_sender = sender.clone();
+                let detect_testing = testing;
+                let detect_status = detections;
+                let edit_name = name.clone();
+                let edit_original = original;
+                let edit_editing = editing;
                 let delete_common = common.clone();
                 let delete_name = name.clone();
                 let delete_active = name.clone();
 
+                let status = detections.get().get(&name).cloned();
+                let is_testing = testing.get().as_deref() == Some(name.as_str());
+                let status_text = if is_testing {
+                    "Checking…".to_string()
+                } else {
+                    match &status {
+                        Some(AgentDetection::Passed(_)) => "Ready".to_string(),
+                        Some(AgentDetection::Failed(error)) => {
+                            format!("Failed: {error}")
+                        }
+                        None => String::new(),
+                    }
+                };
+                let status_color = matches!(status, Some(AgentDetection::Failed(_)));
+                let status_hidden = status_text.is_empty();
+                let status_label = status_text.clone();
+
                 h_stack((
                     stack((
-                        label(move || row_name.clone()).style(move |s| {
-                            let config = config.get();
-                            s.width_full()
-                                .text_ellipsis()
-                                .font_size(config.ui.font_size() as f32)
-                                .color(config.color(LapceColor::EDITOR_FOREGROUND))
-                                .selectable(false)
-                        }),
+                        h_stack((
+                            label(move || row_name.clone()).style(move |s| {
+                                let config = config.get();
+                                s.text_ellipsis()
+                                    .min_width(0.0)
+                                    .font_size(config.ui.font_size() as f32)
+                                    .color(
+                                        config.color(LapceColor::EDITOR_FOREGROUND),
+                                    )
+                                    .selectable(false)
+                            }),
+                            label(move || status_label.clone()).style(move |s| {
+                                let config = config.get();
+                                s.padding_left(6.0)
+                                    .text_ellipsis()
+                                    .min_width(0.0)
+                                    .font_size(config.ui.font_size() as f32 - 1.5)
+                                    .color(if status_color {
+                                        config.color(LapceColor::LAPCE_ERROR)
+                                    } else {
+                                        config.color(LapceColor::EDITOR_DIM)
+                                    })
+                                    .selectable(false)
+                                    .apply_if(status_text.is_empty(), |s| s.hide())
+                            }),
+                        ))
+                        .style(|s| s.items_center().min_width(0.0)),
                         label(move || command.clone()).style(move |s| {
                             let config = config.get();
-                            s.width_full()
-                                .text_ellipsis()
+                            s.text_ellipsis()
+                                .min_width(0.0)
                                 .font_size(config.ui.font_size() as f32 - 1.0)
                                 .color(config.color(LapceColor::EDITOR_DIM))
                                 .selectable(false)
                         }),
                         label(move || env_text.clone()).style(move |s| {
                             let config = config.get();
-                            s.width_full()
-                                .text_ellipsis()
+                            s.text_ellipsis()
+                                .min_width(0.0)
                                 .font_size(config.ui.font_size() as f32 - 1.5)
                                 .color(config.color(LapceColor::EDITOR_DIM))
                                 .selectable(false)
@@ -665,11 +789,66 @@ fn agent_profiles_section(
                     ))
                     .style(|s| s.flex_col().flex_grow(1.0f32).min_width(0.0)),
                     settings_action_button(
+                        "Detect",
+                        move || {
+                            let name = detect_name.clone();
+                            let command = detect_command.clone();
+                            let env = detect_env.clone();
+                            let common = detect_common.clone();
+                            let sender = detect_sender.clone();
+                            let cwd = common
+                                .workspace
+                                .path
+                                .clone()
+                                .or_else(|| std::env::current_dir().ok())
+                                .unwrap_or_default();
+                            let env_pairs: Vec<(String, String)> = env
+                                .iter()
+                                .filter_map(|entry| {
+                                    let (key, value) = entry.split_once('=')?;
+                                    Some((key.trim().to_string(), value.to_string()))
+                                })
+                                .collect();
+                            detect_testing.set(Some(name.clone()));
+                            std::thread::spawn(move || {
+                                let result =
+                                    detect_agent(&command, &cwd, &env_pairs)
+                                        .map_err(|error| format!("{error:#}"));
+                                let _ = sender.send((name, result));
+                            });
+                        },
+                        config,
+                    ),
+                    settings_action_button(
+                        if enabled { "Disable" } else { "Enable" },
+                        move || {
+                            if enabled {
+                                set_profile_enabled(
+                                    &checkbox_common,
+                                    &checkbox_name,
+                                    false,
+                                );
+                                return;
+                            }
+                            let passed = matches!(
+                                detect_status.get_untracked().get(&checkbox_name),
+                                Some(AgentDetection::Passed(_))
+                            );
+                            if passed {
+                                set_profile_enabled(
+                                    &checkbox_common,
+                                    &checkbox_name,
+                                    true,
+                                );
+                            }
+                        },
+                        config,
+                    ),
+                    settings_action_button(
                         "Edit",
                         move || {
-                            let _ = &row_common;
-                            original.set(name.clone());
-                            editing.set(true);
+                            edit_original.set(edit_name.clone());
+                            edit_editing.set(true);
                         },
                         config,
                     ),
@@ -697,7 +876,7 @@ fn agent_profiles_section(
                         config,
                     ),
                 ))
-                .style(|s| s.width_full().items_center().gap(8.0).padding_vert(4.0))
+                .style(|s| s.width_full().items_center().gap(6.0).padding_vert(4.0))
             }))
             .style(|s| s.flex_col().width_full())
         },
@@ -749,6 +928,10 @@ fn agent_profile_form(
         .profiles()
         .into_iter()
         .find(|profile| profile.name == original);
+    let enabled = existing
+        .as_ref()
+        .map(|profile| profile.enabled)
+        .unwrap_or(false);
 
     let name_input = TextInputBuilder::new()
         .value(
@@ -837,6 +1020,7 @@ fn agent_profile_form(
                         name: name.clone(),
                         command,
                         env,
+                        enabled,
                     });
                     let active = if active == save_original || active.is_empty() {
                         name

@@ -1640,6 +1640,10 @@ impl WindowTabData {
     pub fn run_internal_command(&self, cmd: InternalCommand) {
         let cx = self.scope;
         match cmd {
+            InternalCommand::OpenAgentSettings => {
+                self.main_split.open_settings();
+                crate::settings::request_settings_section("Agent");
+            }
             InternalCommand::ReloadConfig => {
                 self.reload_config();
             }

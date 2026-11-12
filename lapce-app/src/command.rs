@@ -629,6 +629,7 @@ pub enum LapceWorkbenchCommand {
 #[derive(Clone, Debug)]
 pub enum InternalCommand {
     ReloadConfig,
+    OpenAgentSettings,
     OpenFile {
         path: PathBuf,
     },

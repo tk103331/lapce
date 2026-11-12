@@ -31,7 +31,7 @@ use crate::{
         AgentUsage, PendingPermission,
     },
     app::clickable_icon,
-    command::{CommandExecuted, CommandKind},
+    command::{CommandExecuted, CommandKind, InternalCommand},
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
     keypress::{KeyPressFocus, condition::Condition},
     markdown::{MarkdownContent, parse_markdown},
@@ -380,13 +380,28 @@ fn new_session_selector(
 
             let items: im::Vector<SelectOption> = profiles
                 .iter()
+                .filter(|profile| profile.enabled)
                 .map(|profile| SelectOption {
                     id: profile.name.clone(),
                     label: profile.name.clone(),
                 })
                 .collect();
             if items.is_empty() {
-                return empty().into_any();
+                let setup_agent = agent.clone();
+                return clickable_icon(
+                    || LapceIcons::ADD,
+                    move || {
+                        let _ = setup_agent
+                            .common
+                            .internal_command
+                            .send(InternalCommand::OpenAgentSettings);
+                    },
+                    || false,
+                    || false,
+                    || "Enable an agent in Settings",
+                    config,
+                )
+                .into_any();
             }
 
             let select_agent = agent.clone();
@@ -607,14 +622,6 @@ fn header(agent: AgentData, config: ReadSignal<Arc<LapceConfig>>) -> impl View {
         ))
         .style(|s| s.flex_col().flex_grow(1.0f32).min_width(0.0)),
         h_stack((
-            clickable_icon(
-                || LapceIcons::HISTORY,
-                move || sessions_button.toggle_sessions(),
-                move || sessions_active.sessions_open.get(),
-                || false,
-                || "Session history",
-                config,
-            ),
             new_session_selector(new_session.clone(), config, move || is_busy.get()),
             clickable_icon(
                 || LapceIcons::DEBUG_STOP,
@@ -630,6 +637,14 @@ fn header(agent: AgentData, config: ReadSignal<Arc<LapceConfig>>) -> impl View {
                 || false,
                 || false,
                 || "Restart agent",
+                config,
+            ),
+            clickable_icon(
+                || LapceIcons::HISTORY,
+                move || sessions_button.toggle_sessions(),
+                move || sessions_active.sessions_open.get(),
+                || false,
+                || "Session history",
                 config,
             ),
         ))
@@ -1088,6 +1103,11 @@ fn options_panel(
             }
             if let Some(button) = config_button {
                 selectors.push(
+                    empty()
+                        .style(|s| s.flex_grow(1.0).min_width(0.0))
+                        .into_any(),
+                );
+                selectors.push(
                     container(button)
                         .style(|s| s.items_center().padding_left(2.0))
                         .into_any(),
@@ -1288,13 +1308,7 @@ fn model_row(
 
     Some(
         h_stack((option_label("Model".to_string(), config), dropdown))
-            .style(|s| {
-                s.flex_grow(1.0f32)
-                    .flex_basis(0.0)
-                    .min_width(0.0)
-                    .items_center()
-                    .gap(6.0)
-            })
+            .style(|s| s.items_center().gap(6.0).min_width(0.0))
             .into_any(),
     )
 }
@@ -1334,13 +1348,7 @@ fn mode_row(
 
     Some(
         h_stack((option_label("Mode".to_string(), config), dropdown))
-            .style(|s| {
-                s.flex_grow(1.0f32)
-                    .flex_basis(0.0)
-                    .min_width(0.0)
-                    .items_center()
-                    .gap(6.0)
-            })
+            .style(|s| s.items_center().gap(6.0).min_width(0.0))
             .into_any(),
     )
 }
